@@ -3,7 +3,7 @@ import { createServer } from "node:http"
 import { createRequire } from "node:module"
 import { tmpdir } from "node:os"
 import { dirname, join, resolve } from "node:path"
-import { pathToFileURL } from "node:url"
+import { fileURLToPath, pathToFileURL } from "node:url"
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest"
 
 import { settleTurnWithinBudget } from "../src/client.js"
@@ -241,7 +241,7 @@ describe("settleTurnWithinBudget", () => {
  * the cancelling race.
  */
 describe("the client wires both halves", () => {
-  const packageRoot = resolve(dirname(new URL(import.meta.url).pathname), "..")
+  const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..")
 
   const codeOnly = (source: string): string =>
     source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "")
