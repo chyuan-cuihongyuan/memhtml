@@ -3,9 +3,13 @@ import { chmod } from "node:fs/promises"
 import { join } from "node:path"
 import { promisify } from "node:util"
 
+import { DatabaseService, Git, Store } from "@memhtml/cli"
+import type { DatabaseShape } from "@memhtml/index"
+import { Effect } from "effect"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 
 import type { DoctorReport } from "../src/doctor.js"
+import { doctor } from "../src/doctor.js"
 import { type Cli, makeCli } from "./harness.js"
 
 const git = promisify(execFile)
@@ -185,5 +189,60 @@ describe("doctor counts untyped entity references", () => {
     // The load-bearing half: a corpus whose only finding is untyped entities is still healthy. Gating
     // on it would turn every hand-authored corpus red for writing metas the way the format allows.
     expect(report.healthy).toBe(true)
+  })
+})
+
+/**
+ * A doctor whose database cannot answer must not report `healthy: true`.
+ *
+ * Every check used to degrade its read to the typed empty value — `[]`, `0`, `undefined` — so a
+ * `SQLITE_BUSY` past `busy_timeout` produced a report computed from checks that never ran, every
+ * one of them reading clean. That is the wrong answer that looks right, on the one command an
+ * operator runs precisely when something is wrong. The fix is the `degraded` list: a check whose
+ * read failed is named there (by the report field a consumer would otherwise trust) and forces
+ * `healthy: false`, while its finding fields keep their typed empty shapes so a parser that
+ * ignores `degraded` still sees the structures it always did.
+ *
+ * Staged by providing the real `doctor` with a database whose every call fails and git/store
+ * halves that succeed, which is the shape of a wedged database on an intact repo.
+ */
+describe("doctor reports a degraded read rather than a clean one", () => {
+  const failingDb = {
+    hasState: false,
+    get: () => Effect.fail(new Error("database is locked")),
+    all: () => Effect.fail(new Error("database is locked")),
+    run: () => Effect.fail(new Error("database is locked"))
+  } as unknown as DatabaseShape
+
+  const gitHalf = {
+    revParseHead: () => Effect.succeed("1111111111111111111111111111111111111111"),
+    run: () => Effect.fail(new Error("unused"))
+  } as never
+
+  const storeHalf = {
+    dirtyPaths: () => Effect.succeed([]),
+    readMemory: () => Effect.fail(new Error("unused"))
+  } as never
+
+  it("names the checks that failed and refuses healthy", async () => {
+    const report = await Effect.runPromise(
+      doctor({ fix: false }).pipe(
+        Effect.provideService(Git, gitHalf),
+        Effect.provideService(Store, storeHalf),
+        Effect.provideService(DatabaseService, failingDb)
+      )
+    )
+    expect(report.degraded.length).toBeGreaterThan(0)
+    // Every degraded name is a field the consumer can see, and the load-bearing one is healthy.
+    expect(report.healthy).toBe(false)
+    for (const name of report.degraded) {
+      expect(typeof name).toBe("string")
+      expect(name.length).toBeGreaterThan(0)
+    }
+    // The typed empty shapes survive, so a parser that ignores `degraded` sees what it always did.
+    expect(report.dangling).toEqual([])
+    expect(report.overdueTasks).toEqual([])
+    expect(report.warnings).toEqual([])
+    expect(report.inboxDepth).toBe(0)
   })
 })
