@@ -385,6 +385,13 @@ export const runExec = (
          * naming the limit, is what reaches `stderr`. The margin is a grace period rather than extra
          * budget. The script is already cut off at `timeoutMs`, and the shell's bound exists only to
          * catch the case where `js-exec` itself fails to stop.
+         *
+         * Byte bounds are NOT restated here: just-bash's default `ExecutionLimits` profile already
+         * caps every memory-shaped resource a script can reach — live/intermediate bytes at 512 MiB,
+         * total output at 256 MiB, one string at 64 MiB, arrays at a million elements, the default
+         * in-memory filesystem at 1 GiB (`dist/limits.d.ts`). Restating a number here would fork the
+         * policy: a future just-bash default change would stop applying the moment this list went
+         * stale, and nothing in this repo would notice.
          */
         const bash = new Bash({
           fs: filesystem,

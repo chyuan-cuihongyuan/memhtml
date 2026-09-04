@@ -391,6 +391,53 @@ describe("error envelopes", () => {
     expect(body.error).toBe("unknown flag: --nope")
   })
 
+  it("refuses an exec --sha that is not commit hex, before any worktree is made", async () => {
+    /**
+     * `--sha` reaches `git worktree add` argv, so a value git would parse as an option or a ref
+     * (`HEAD~1`, a branch name) is a usage error rather than git's interpretation of it. Mirrors
+     * `git.ts`'s `diffTreeNames`, which pins the same shape for the same reason. Refused in
+     * `validate`, so no service is built and no worktree exists — exit 2 with the hex rule named.
+     *
+     * A `--`-prefixed value is caught one layer EARLIER, by the unknown-flag rule — `--sha --force`
+     * parses as a valueless `--sha` plus the unknown flag `--force` — which is a second, independent
+     * wall in front of the same injection, asserted first.
+     */
+    const dashDash = await run(["exec", "--sha", "--force", "--script", "console.log(1)"])
+    expect(dashDash.exitCode).toBe(EXIT_USAGE)
+    expect(parse(dashDash.stdout).code).toBe("ERR_INVALID_FLAG")
+
+    for (const sha of ["HEAD~1", "main", "zzzz", "abc"]) {
+      const result = await run(["exec", "--sha", sha, "--script", "console.log(1)"])
+      expect(result.exitCode, sha).toBe(EXIT_USAGE)
+      const body = parse(result.stdout)
+      expect(body.code, sha).toBe("ERR_INVALID_FLAG")
+      expect(body.error, sha).toContain("--sha must be 4 to 40 hex characters")
+    }
+    // A real abbreviated and a full-length hash pass the check (the run may fail later for other
+    // reasons, but not with the flag's own refusal).
+    for (const sha of ["0123456789ab", "0123456789abcdef0123456789abcdef01234567"]) {
+      const result = await run(["exec", "--sha", sha, "--script", "console.log(1)"])
+      const body = parse(result.stdout)
+      expect(body.error ?? "", sha).not.toContain("--sha must be 4 to 40 hex characters")
+    }
+  })
+
+  it("refuses a sleep run --date that is not a calendar date, before any branch is named", async () => {
+    /**
+     * The date names the run branch and anchors every phase's stamps. A malformed value does not
+     * fail on its own: `instantFor` falls back to epoch 0, so `--date yesterday` would stamp a
+     * run's commits 1970-01-01 and order them before every real memory in the recency arms. The
+     * calendar round-trip is part of the rule: `2026-02-30` parses but does not exist.
+     */
+    for (const date of ["yesterday", "2026-9-3", "2026-09-03T00:00:00Z", "2026-02-30", ""]) {
+      const result = await run(["sleep", "run", "--date", date, "--dry-run"])
+      expect(result.exitCode, date).toBe(EXIT_USAGE)
+      const body = parse(result.stdout)
+      expect(body.code, date).toBe("ERR_INVALID_FLAG")
+      expect(body.error, date).toContain("--date must be a calendar date as YYYY-MM-DD")
+    }
+  })
+
   describe("a boolean flag given a space-separated value", () => {
     /**
      * The silent inversion. A boolean flag does not consume the next token, so `--embed false` is
