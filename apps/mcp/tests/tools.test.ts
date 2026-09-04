@@ -9,14 +9,14 @@ import { SERVER_NAME } from "../src/server.js"
 import { MemhtmlToolkit, TOOL_NAMES } from "../src/tools.js"
 
 /**
- * The tool surface as a contract: fifteen names, `Schema.Struct` parameters, and JSON Schemas a
+ * The tool surface as a contract: eighteen names, `Schema.Struct` parameters, and JSON Schemas a
  * client can validate against.
  *
  * `TOOL_NAMES` is derived from the toolkit, so every count assertion below is about the SERVER. A
- * hand-maintained list would let a toolkit that builds fourteen tools pass a test asserting fifteen.
+ * hand-maintained list would let a toolkit that builds seventeen tools pass a test asserting eighteen.
  */
 
-/** The fifteen names: design.md §8's table in its own order, with the batch behind the singular. */
+/** The eighteen names: design.md §8's table in its own order, the batch behind the singular, the task family before the trace plane. */
 const EXPECTED = [
   "memory_write",
   "memory_write_batch",
@@ -30,6 +30,9 @@ const EXPECTED = [
   "memory_archive",
   "memory_reinforce",
   "memory_list",
+  "task_add",
+  "task_status",
+  "task_list",
   "trace_search",
   "trace_links",
   "memory_status"
@@ -48,9 +51,9 @@ const schemaFor = (name: string): JsonSchemaObject =>
   ) as unknown as JsonSchemaObject
 
 describe("tool surface", () => {
-  it("declares exactly fifteen distinct tools, in design §8's order", () => {
-    expect(TOOL_NAMES).toHaveLength(15)
-    expect(new Set(TOOL_NAMES).size).toBe(15)
+  it("declares exactly eighteen distinct tools, in design §8's order", () => {
+    expect(TOOL_NAMES).toHaveLength(18)
+    expect(new Set(TOOL_NAMES).size).toBe(18)
     expect([...TOOL_NAMES]).toEqual([...EXPECTED])
   })
 
@@ -923,9 +926,10 @@ describe("the body-to-claim split", () => {
   it("holds no second copy of the prose split anywhere in its emitted bytes", async () => {
     const { readdir, readFile } = await import("node:fs/promises")
     const { join } = await import("node:path")
+    const { fileURLToPath } = await import("node:url")
     /** `claimFromProse`'s first-sentence pattern and `proseTail`'s blank-line pattern, as emitted. */
     const SIGNATURES = ["(.*?[.!?])(\\s|$)", "\\n\\s*\\n"]
-    const dist = new URL("../dist", import.meta.url).pathname
+    const dist = fileURLToPath(new URL("../dist", import.meta.url))
     const entries = await readdir(dist, { recursive: true, withFileTypes: true })
     const files = entries
       .filter((entry) => entry.isFile() && entry.name.endsWith(".js"))
