@@ -35,3 +35,7 @@ dist-typecheck-probe/
 # apps/docs/src/content/docs/internals/_figures/. The source is the .d2 file; the SVG is a build output,
 # declared as one in turbo.json so a cache hit restores it.
 apps/docs/public/d2/
+# Local agent-tooling state (security-scan ledgers, session scratch), the same class as .codegraph/:
+# per-machine, derived, never part of the corpus.
+.mimosa/
+.zcode/
