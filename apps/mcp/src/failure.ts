@@ -56,7 +56,7 @@ const text = (value: unknown): string | undefined => (typeof value === "string" 
 /**
  * What to do about a failure, phrased as calls this agent can actually make.
  *
- * The reader is an LLM mid-task holding fifteen tools and no shell. `suggestionsFor` in
+ * The reader is an LLM mid-task holding eighteen tools and no shell. `suggestionsFor` in
  * `apps/cli/src/errors.ts:115-137` answers the same question for a human at a prompt and answers it in
  * `memhtml` commands and `git` invocations, every one of which is unreachable from here. A suggestion
  * an agent cannot execute costs more than none: it spends the model's attention on a plan that ends in
@@ -110,6 +110,16 @@ export const mcpSuggestionsFor = (error: unknown): ReadonlyArray<string> => {
       return [
         "retry — search degrades to the lexical floor without the embedder, so results are narrower but real",
         "call memory_status to see whether the embedder is up"
+      ]
+    /**
+     * The same recovery shape as `ModelUnavailable`, for the CLI door's reason: an off-schema turn
+     * is a model-side failure, and `codeFor` files it under the same `ERR_MODEL_UNAVAILABLE`. The
+     * phase-level isolation has already degraded the run, so the agent's move is the same retry.
+     */
+    case "LlmContractViolation":
+      return [
+        "retry — a turn that settles off-schema is usually transient",
+        "call memory_status to see when the model-calling phases last succeeded"
       ]
     case "EmbedModelMismatch":
       return [
