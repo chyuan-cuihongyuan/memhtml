@@ -1,6 +1,6 @@
 {
   "name": "@memhtml/traces",
-  "version": "0.11.1",
+  "version": "0.14.0",
   "private": true,
   "description": "Streaming JSONL parser and trace indexer.",
   "type": "module",
@@ -35,9 +35,9 @@
     "effect": "catalog:"
   },
   "devDependencies": {
-    "@biomejs/biome": "2.5.10",
+    "@biomejs/biome": "2.5.11",
     "@effect/vitest": "catalog:",
-    "@types/node": "26.2.0",
+    "@types/node": "26.4.0",
     "typescript": "7.0.2",
     "vitest": "4.1.11"
   }

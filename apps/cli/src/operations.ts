@@ -24,6 +24,7 @@ import {
   type FacetFilter,
   type FrameMatch,
   facetConditions,
+  ftsQueryForms,
   Indexer,
   IndexRecorder,
   type IndexRecorderShape,
@@ -31,10 +32,10 @@ import {
   persistScanned,
   Retrieval,
   readIndexState,
+  readVectorCoverage,
   readWatermark,
   reinforce,
   type SearchScope,
-  sanitizeFtsQuery,
   type TailMerger
 } from "@memhtml/index"
 import { EMBED_WATERMARK } from "@memhtml/llm"
@@ -43,7 +44,7 @@ import { attemptIo, commitSubject, Store, type WriteInput } from "@memhtml/store
 import { mergeTailExtract, type SessionExtract, scanTraceRoot } from "@memhtml/traces"
 import { Effect } from "effect"
 
-import { Embedder, type EmbedderShape, ExtractorPort, Roots } from "./api-layer.js"
+import { Embedder, type EmbedderShape, ExtractorPort, RetrievalPolicy, Roots } from "./api-layer.js"
 import type { ErrorCode } from "./envelope.js"
 import { codeFor, messageFor } from "./errors.js"
 import type { ExtractionItem } from "./extraction.js"
@@ -2533,8 +2534,14 @@ export interface TraceSearchParams {
  *
  * The query goes through the same sanitizer the memory arms use, and it has to. An apostrophe is a
  * hard driver error rather than an empty result, and "what did I ask about don't-repeat-yourself"
- * is an ordinary trace query. An empty sanitized query returns the most recent sessions rather
- * than nothing, because a caller with no terms wants a listing and an empty MATCH is not a listing.
+ * is an ordinary trace query. The two MATCH forms are used the way the memory arm uses them: the
+ * all-terms form first, and when it returns no session the any-of form, ranked by bm25. A first
+ * prompt is a sentence and a trace query is a sentence about it, so the two share some words rather
+ * than all of them, and the all-terms form alone finds a session only when its prompt holds every
+ * word of the query. The rerun is the whole statement with the other form bound, so the order a
+ * caller sees is bm25's own order for the form that answered. An empty sanitized query returns the
+ * most recent sessions rather than nothing, because a caller with no terms wants a listing and an
+ * empty MATCH is not a listing.
  *
  * This is the trace plane and it stops here. No memory table is named, and nothing in the
  * retrieval assembler names `traces`. The firewall is by table name, in both directions.
@@ -2542,38 +2549,36 @@ export interface TraceSearchParams {
 export const searchTraces = (params: TraceSearchParams) =>
   Effect.gen(function* () {
     const db = yield* DatabaseService
-    const match = sanitizeFtsQuery(params.query)
+    const forms = ftsQueryForms(params.query)
     const limit = Math.min(200, Math.max(1, Math.trunc(params.limit ?? 20)))
 
-    const conditions: Array<string> = []
-    const values: Array<string | number> = []
     /**
      * The MATCH names `traces_fts` rather than a column of `traces`. The index is an external-content
      * FTS5 table, so it is joined in by rowid and only reached when there is something to match. Without
      * a query the statement never mentions it, which is what keeps a bare listing a plain table scan.
      */
-    const matched = match !== ""
+    const matched = forms.any !== ""
     const from = matched
       ? "FROM traces_fts JOIN traces t ON t.rowid = traces_fts.rowid"
       : "FROM traces t"
-    if (matched) {
-      conditions.push("traces_fts MATCH ?")
-      values.push(match)
-    }
+    const conditions: Array<string> = matched ? ["traces_fts MATCH ?"] : []
+    const scopeValues: Array<string | number> = []
     if (params.cwd !== undefined && params.cwd !== "") {
       conditions.push("t.cwd = ?")
-      values.push(params.cwd)
+      scopeValues.push(params.cwd)
     }
     if (params.since !== undefined && params.since !== "") {
       conditions.push("t.started_at >= ?")
-      values.push(params.since)
+      scopeValues.push(params.since)
     }
 
     const where = conditions.length === 0 ? "" : `WHERE ${conditions.join(" AND ")}`
     // A matched query orders by relevance, ascending because FTS5's bm25 is negative-is-better.
     // Without a match there is no relevance to order by and recency is the useful order.
     const order = matched ? "ORDER BY bm25(traces_fts)" : "ORDER BY t.started_at DESC"
-    const rows = yield* db.all<{
+    const sql = `SELECT t.session_id, t.slug, t.cwd, t.started_at, t.prompt_count, t.first_prompt, t.ai_title
+       ${from} ${where} ${order} LIMIT ?`
+    interface TraceRow {
       session_id: string
       slug: string
       cwd: string | null
@@ -2581,11 +2586,14 @@ export const searchTraces = (params: TraceSearchParams) =>
       prompt_count: number
       first_prompt: string
       ai_title: string | null
-    }>(
-      `SELECT t.session_id, t.slug, t.cwd, t.started_at, t.prompt_count, t.first_prompt, t.ai_title
-       ${from} ${where} ${order} LIMIT ?`,
-      [...values, limit]
-    )
+    }
+    const query = (match: string | undefined) =>
+      db.all<TraceRow>(sql, [...(match === undefined ? [] : [match]), ...scopeValues, limit])
+    const strict = yield* query(matched ? forms.all : undefined)
+    // The any-of rerun only when the all-terms form answered nothing and the two forms differ, so
+    // a one-word query and a listing each run one statement.
+    const rows =
+      strict.length === 0 && matched && forms.all !== forms.any ? yield* query(forms.any) : strict
 
     return {
       sessions: rows.map((row) => ({
@@ -2597,7 +2605,7 @@ export const searchTraces = (params: TraceSearchParams) =>
         firstPrompt: row.first_prompt,
         aiTitle: row.ai_title
       })),
-      degraded: match === ""
+      degraded: forms.any === ""
     }
   })
 
@@ -2677,11 +2685,17 @@ export const traceLinks = (params: {
  * `embedderUp` is read off the stored watermark rather than by probing Bedrock. A status call that
  * made a network request would fail for a reason unrelated to the corpus, and what a caller
  * needs to know is whether the vectors in this index are usable.
+ *
+ * `vectorCoverage` is the comparison `chunks` and `embeddings` side by side never made (issue #141):
+ * the share of chunks with a vector in the configured space, beside the floor a search degrades at.
+ * `embedderUp` can be true at 2 percent coverage, because one vector in the right space satisfies it;
+ * this is the number that says how much of the corpus the vector arm can see.
  */
 export const statusReport = () =>
   Effect.gen(function* () {
     const store = yield* Store
     const db = yield* DatabaseService
+    const policy = yield* RetrievalPolicy
 
     const headSha = yield* store.git.revParseHead()
     const dirty = yield* store.dirtyPaths()
@@ -2698,12 +2712,34 @@ export const statusReport = () =>
     const embeddings = yield* countOne(db, "SELECT count(*) AS n FROM embeddings")
     const chunks = yield* countOne(db, "SELECT count(*) AS n FROM chunks")
     const traces = yield* countOne(db, "SELECT count(*) AS n FROM traces")
+    const coverage = yield* readVectorCoverage(db, EMBED_WATERMARK)
 
     const lastSleep = yield* db
       .get<{ run_id: string; status: string; started_at: string }>(
         "SELECT run_id, status, started_at FROM sleep_runs ORDER BY started_at DESC LIMIT 1"
       )
       .pipe(Effect.orElseSucceed(() => undefined))
+
+    const indexFresh = state?.head_sha !== null && state?.head_sha === headSha
+    /**
+     * A stale index is also said on stderr, once per call (issue #145). The payload already carries
+     * `indexFresh`, and the reader who needs the warning is the one who cannot read the payload: the
+     * operator of a `serve mcp` process, whose agents call `memory_status` and whose only view of the
+     * store is the server's log. The line names both commits and the one recovery.
+     *
+     * The predicate is `indexFresh` itself, so the WARN fires exactly where the flag is false. Two
+     * cases that are correct rather than noise: an absent watermark row is stale by definition
+     * (`memhtml init` commits the layout and indexes nothing, so the first `status` after it warns
+     * "index describes no commit" until the first `index update`), and between `sleep run` and
+     * `sleep merge` HEAD is the sleep branch tip while the index describes `main`, so every `status`
+     * in that window warns.
+     */
+    if (!indexFresh) {
+      yield* Effect.logWarning(
+        `index describes ${state?.head_sha ?? "no commit"}, HEAD is ${headSha}; ` +
+          `run memhtml index update --embed`
+      )
+    }
 
     return {
       root: store.root,
@@ -2717,13 +2753,15 @@ export const statusReport = () =>
       chunks,
       embeddings,
       traces,
-      indexFresh: state?.head_sha !== null && state?.head_sha === headSha,
+      indexFresh,
       indexHeadSha: state?.head_sha ?? null,
       embedModel: state?.embed_model ?? null,
       // A stored watermark that disagrees with the configured one means every cosine in this index
       // is against a different vector space. Reporting it as "up" would be the silent half-migration
       // the indexer refuses at write time.
       embedderUp: state !== undefined && state.embed_model === EMBED_WATERMARK && embeddings > 0,
+      vectorCoverage: coverage.coverage,
+      vectorCoverageFloor: policy.vectorCoverageFloor,
       hasState: db.hasState,
       lastSleep:
         lastSleep === undefined

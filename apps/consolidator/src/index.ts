@@ -15,15 +15,16 @@ export * from "./contract.js"
  */
 export * from "./llm-proxy.js"
 /**
+ * The model, tools, and turn are exported for the test tier and for a reader tracing a run; the
+ * production caller reaches them only through `makeConsolidator`.
+ */
+export * from "./model.js"
+/**
  * The mount composition is exported because `memhtml exec` builds on it: one shared helper rather than
  * the same `MountableFs` + read-only `OverlayFs` shape written twice, and this package is where
  * `just-bash` is a real dependency pinned to the version eve loads.
  */
 export * from "./mount.js"
-/**
- * The run credential is exported because `agent/channels/eve.ts` imports it, and that file is compiled
- * by eve into the SERVER process. That is a different build than this package's `tsc -b`, reaching
- * `src/` by relative path exactly as `agent/sandbox/sandbox.ts` reaches `mount.ts`. Nothing outside
- * this app consumes it: the client mints and signs, the channel verifies, and there is no third caller.
- */
-export * from "./run-auth.js"
+export * from "./output-budget.js"
+export * from "./tools.js"
+export * from "./turn.js"

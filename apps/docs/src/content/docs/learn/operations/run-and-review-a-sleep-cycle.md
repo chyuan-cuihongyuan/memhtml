@@ -87,12 +87,15 @@ memhtml sleep run --dry-run
       }
     ],
     "failedPhases": [],
-    "commits": []
+    "commits": [],
+    "reaped": []
   }
 }
 ```
 
 Every phase reports `status`, a `counts` object shaped to that phase, a `commitSha`, and its own `llmCalls`. `commitSha` is null on a dry run and on the phases that commit nothing by design. `failedPhases` is there so you can see whether anything failed without filtering the array yourself.
+
+`reaped` lists earlier runs' `sleep_runs` rows this run stamped `abandoned` before it started, each as `{ "runId", "reason" }`. A run writes its row `running` before the first phase and rewrites it after the last, so a process killed in between leaves a row nothing finishes. At start, every `sleep run` (a dry run too) closes such a row when its branch is gone (`"branch gone"`) or when it started more than 20 hours ago (`"started 41h ago, past budget"`), and logs one line per row. A row that is young and whose branch exists is a run executing right now and is left alone. `memhtml doctor` lists the same rows under `stuckSleepRuns` until a run reaps them. `sleep resume` reaps nothing, because it exists to finish a `running` row.
 
 Two phases commit nothing even on a real run, by design. `preflight` only refreshes the index, and `relationship-mining` writes its derived edges into the index alone, because thousands of edges the system can derive again would bury every real diff.
 
@@ -143,7 +146,7 @@ To abort, drop the branch. `main` never moved:
 git branch -D sleep/2026-08-12
 ```
 
-Dropping the branch discards the run's **pending state-plane marks** along with its commits, and that is the point of them. Three writes a phase makes would otherwise outlive the branch, because `.memhtml/state.db` is not rebuildable from the tree: a `trace-consolidation` watermark, an edge promotion, and an entity promotion. So each is recorded instead as a line in `.memhtml/sleep/<run-id>.pending.jsonl`, a committed file on the run's own branch, and `memhtml sleep merge` applies them after the fast-forward succeeds, reporting `marksPending` beside `marksApplied` (`packages/sleep/src/contract.ts:306`).
+Dropping the branch discards the run's **pending state-plane marks** along with its commits, and that is the point of them. Three writes a phase makes would otherwise outlive the branch, because `.memhtml/state.db` is not rebuildable from the tree: a `trace-consolidation` watermark, an edge promotion, and an entity promotion. So each is recorded instead as a line in `.memhtml/sleep/<run-id>.pending.jsonl`, a committed file on the run's own branch, and `memhtml sleep merge` applies them after the fast-forward succeeds, reporting `marksPending` beside `marksApplied` (`packages/sleep/src/contract.ts:306`). The same file carries one record kind, `commitment-below-floor`: every commitment the consolidator extracted that scored under the floor, with its statement, confidence, and session. The report lists those under a fold above the phase table so you can judge what the floor refused; `merge` counts them as applied and writes nothing for them.
 
 Nothing in that ledger is lost work. A session whose watermark never applied is simply re-read on the next cycle — one model call, and a candidate a reviewer may decline — and a counter that stays unset leaves its pair eligible again. Without the ledger the watermark would be the expensive case: it is an anti-join, so a session it covers is never selected again, and a discarded branch would leave the transcript unread behind a row asserting it was handled. Corroboration counters stay at phase time on purpose, because `detections` counts the nights a model read the corpus and proposed the merge, and a night you discarded did both.
 
@@ -185,6 +188,8 @@ A refusal arrives as a value on the report rather than as an error (`packages/sl
 | `no-run`        | No such run id.                                                                                                                                         | `memhtml sleep status`.                                                                  |
 | `main-advanced` | `main` moved past the run's `base_sha`, so the run curated a corpus that no longer exists. This is also the refusal when the fast-forward itself fails. | Re-run the sleep cycle. Every phase is safe to repeat, so it is cheap.                   |
 | `gate-failed`   | The discrimination gate refused: this run degrades retrieval.                                                                                           | `memhtml eval discriminate` to see which probes inverted, then `git branch -D <run-id>`. |
+
+A merge that happened also projects the merged commit into the index, with the same incremental update `memhtml index update --embed` runs, so the night's memories are searchable when the command returns. The report says so as `indexUpdated: true` with `indexHeadSha` equal to `headSha`, and `indexAdded`, `indexModified`, `indexRemoved`, `indexRenamed`, and `embeddingsWritten` are that update's counts. `indexUpdated: false` means `main` moved and the index did not follow: `indexError` says why, the log carries a warning naming the recovery, and `memhtml status` reports `indexFresh: false` until you run it.
 
 A merge that happened reports `marksPending` and `marksApplied`. They agree on an ordinary merge, so a merge where they disagree is telling you a state-plane write did not land: the sessions in the shortfall stay unconsolidated and are re-read next cycle, and the server's log carries which mark and why. A failed apply deliberately does not fail the merge — `main` has already moved and the memories are landed — so a reported shortfall is the visible form of that. A refusal applies nothing and reports neither count.
 

@@ -181,6 +181,9 @@ describe("a tool call through the toolkit layer", () => {
     expect(hits[0]?.gist).toBe("Drain the VIP before reverting the deploy.")
     expect(result.degraded).toBe(false)
     expect(result.arms).toContain("vector")
+    // Every chunk the fixture indexed carries a vector, and the ratio travels THROUGH THE WIRE so a
+    // client can tell a sparse-index degradation from an embedder outage (issue #141).
+    expect(result.vector_coverage).toBe(1)
   })
 
   it("memory_search hits carry a snippet whose text comes from the matched file", async () => {
@@ -246,6 +249,30 @@ describe("a tool call through the toolkit layer", () => {
     expect(hits.some((hit) => hit.path !== rival.path)).toBe(true)
     expect(first.scope_empty).toBe(false)
     expect(first.entity_scope).toBeNull()
+    // The archived pointer is the zero shape on a non-empty scope, never absent.
+    expect(first.archived_matches).toBe(0)
+    expect(first.archived).toEqual([])
+
+    // And the non-zero shape crosses the wire: archive the only memory carrying an entity, then scope
+    // to it. The scope empties, the pointer counts the archived row, and nothing superseded it.
+    const ghost = await call("memory_write", {
+      title: "The ghost service owns the retry budget",
+      body: "The ghost service owns the retry budget for its own callers.",
+      memory_type: "semantic",
+      entities: ["service:ghost-api"]
+    })
+    await call("memory_archive", { path: ghost.path, reason: "decommissioned" })
+    const pointer = await call("memory_search", {
+      query: "retry budget",
+      entity: "service:ghost-api"
+    })
+    expect(pointer.hits).toEqual([])
+    expect(pointer.scope_empty).toBe(true)
+    expect(pointer.archived_matches).toBe(1)
+    const archived = pointer.archived as ReadonlyArray<Record<string, unknown>>
+    expect(archived).toHaveLength(1)
+    expect(String(archived[0]?.path)).toMatch(/^archive\//)
+    expect(archived[0]?.superseded_by).toBeNull()
 
     // HOP TWO: the value from hop one, passed VERBATIM. Nothing here reconstructs a reference — that
     // is the contract, and a test that rebuilt the string would be asserting its own arithmetic.
@@ -361,6 +388,9 @@ describe("a tool call through the toolkit layer", () => {
     expect(result.index_fresh).toBe(true)
     expect(Object.keys(result.counts_by_type as Record<string, number>).length).toBeGreaterThan(0)
     expect(result.last_sleep).toBeNull()
+    // The comparison `embedder_up` cannot make: how much of the index the vector arm can see.
+    expect(result.vector_coverage).toBe(1)
+    expect(result.vector_coverage_floor).toBe(0.95)
   })
 
   it("memory_list pages with a keyset cursor", async () => {
@@ -386,6 +416,8 @@ describe("a tool call through the toolkit layer", () => {
     // truncated one.
     expect(Array.isArray(sections.lateral)).toBe(true)
     expect(result.truncated).toBe(false)
+    expect(result.degraded).toBe(false)
+    expect(result.vector_coverage).toBe(1)
   })
 
   it("memory_link, memory_neighbors, and memory_archive round-trip", async () => {

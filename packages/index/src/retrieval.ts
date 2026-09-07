@@ -9,9 +9,23 @@ import {
   foldDisclosure,
   MEMORY_BODY_BUDGET
 } from "./disclosure.js"
-import { sanitizeFtsQuery } from "./fts-query.js"
-import { buildRrfSql, buildSnippetSql, rrfParams, truncateSnippet } from "./retrieval-sql.js"
+import { ftsQueryForms } from "./fts-query.js"
+import { polarityScored } from "./polarity.js"
+import {
+  buildFtsProbeSql,
+  buildRrfSql,
+  buildSnippetSql,
+  PARAM_QUERY_VECTOR,
+  rrfParams,
+  truncateSnippet
+} from "./retrieval-sql.js"
 import { assembleScope, type SearchScope } from "./scope.js"
+import {
+  formatCoverage,
+  readVectorCoverage,
+  VECTOR_COVERAGE_FLOOR,
+  VECTOR_COVERAGE_REMEDY
+} from "./vector-coverage.js"
 
 /**
  * The retrieval surface: `search` returns ranked hits, `recall` returns a pack under a budget.
@@ -89,11 +103,19 @@ export interface SearchHit {
 export interface SearchResult {
   readonly hits: ReadonlyArray<SearchHit>
   /**
-   * True when the vector arm did not fire, because the embedder failed or the index has no vectors,
-   * so the result came from the lexical floor. Reported rather than silent, because an agent
-   * comparing two searches needs to know one of them was ranked by fewer signals.
+   * True when the vector arm did not fire, so the result came from the lexical floor. Three causes:
+   * no embedder is bound, the embedder failed, or `vectorCoverage` is below the floor and the arm was
+   * dropped on purpose (a sparse plane ranks the embedded few above every lexical match, issue #141).
+   * Reported rather than silent, because an agent comparing two searches needs to know one of them
+   * was ranked by fewer signals. `vectorCoverage` tells the third cause from the first two.
    */
   readonly degraded: boolean
+  /**
+   * The share of the index's chunks carrying a vector in the configured space, `0` to `1`, read once
+   * per call. Present on every result so a caller can tell a coverage degradation (this is low) from
+   * an embedder outage (this is high and `degraded` is still true). `1` on an index with no chunks.
+   */
+  readonly vectorCoverage: number
   /** The arms that actually contributed, for the operator envelope. */
   readonly arms: ReadonlyArray<string>
   /**
@@ -116,6 +138,34 @@ export interface SearchResult {
    * conflating them would make the marker mean "no hits", which `hits.length` already says.
    */
   readonly scopeEmpty: boolean
+  /**
+   * How many ARCHIVED memories the same scope matches, computed only when `scopeEmpty` is true and
+   * `0` otherwise.
+   *
+   * The pointer behind an empty scope. Eviction and compress are a `git mv` into `archive/`, and the
+   * default scope excludes archived rows, so a correct facet over a real record (`day=2026-09-02` on a
+   * journal compress folded last night) answers nothing and, without this number, says nothing about
+   * why. With it an agent can tell "never existed" from "archived": retry with `includeArchived`, or
+   * follow `archived[].supersededBy` to what replaced it (issue #130). A scope match rather than a
+   * ranked one: the question is whether the scope's address still resolves, not how the query would
+   * rank what it points at. Only the scope's own axes are re-applied; the archived flag is what flips.
+   * Zero as well under `asOf`, whose lens already admits archived rows, so the flag is not what
+   * emptied that search.
+   */
+  readonly archivedMatches: number
+  /**
+   * Up to `limit` of those archived paths, sorted, each with the path of the memory that superseded it
+   * or `null` when nothing did. Empty unless `scopeEmpty` is true. `supersededBy` is derived from the
+   * `supersedes` edge the way a hit's is, so compress's canonical and `correct`'s replacement both
+   * resolve.
+   */
+  readonly archived: ReadonlyArray<ArchivedMatch>
+}
+
+/** One archived memory the scope of an empty search still matches. */
+export interface ArchivedMatch {
+  readonly path: string
+  readonly supersededBy: string | null
 }
 
 /** A recall request. `budgetChars` bounds the quoted bodies, not the index lines. */
@@ -131,6 +181,8 @@ export interface RecallPack {
   readonly spentChars: number
   readonly truncated: boolean
   readonly degraded: boolean
+  /** The same ratio `search` reports, for the same reason: it names which degradation this is. */
+  readonly vectorCoverage: number
 }
 
 export interface RetrievalShape {
@@ -148,6 +200,18 @@ export interface QueryEmbedPort {
 export interface RetrievalDeps {
   readonly db: DatabaseShape
   readonly embeddings?: QueryEmbedPort | undefined
+  /**
+   * The configured vector space, `@memhtml/llm`'s `EMBED_WATERMARK`, so coverage counts only vectors
+   * the query vector is comparable with. Absent falls back to the stored watermark, which is the
+   * same string whenever the indexer has been allowed to write (`readVectorCoverage`).
+   */
+  readonly embedWatermark?: string | undefined
+  /**
+   * Coverage below which the vector arm is dropped. Defaults to {@link VECTOR_COVERAGE_FLOOR}; the
+   * CLI passes `MEMHTML_VECTOR_COVERAGE_FLOOR` and a test moves it to prove the gate is this
+   * comparison and nothing else.
+   */
+  readonly vectorCoverageFloor?: number | undefined
 }
 
 /** The columns `search` and `recall` both read off a fused path list. */
@@ -186,6 +250,7 @@ const scopeNarrows = (scope: SearchScope): boolean =>
 
 export const makeRetrieval = (deps: RetrievalDeps): RetrievalShape => {
   const { db } = deps
+  const coverageFloor = deps.vectorCoverageFloor ?? VECTOR_COVERAGE_FLOOR
 
   /**
    * The query vector, or `undefined` when there is none.
@@ -210,6 +275,46 @@ export const makeRetrieval = (deps: RetrievalDeps): RetrievalShape => {
           Effect.orElseSucceed(() => undefined)
         )
 
+  /** Does some file the scope admits hold every term of the all-terms MATCH form? */
+  const holdsEveryTerm = (all: string, assembled: ReturnType<typeof assembleScope>) =>
+    Effect.gen(function* () {
+      const sql = buildFtsProbeSql(assembled.holes)
+      const rows = yield* db.all<{ hit: number }>(
+        sql,
+        rrfParams(sql, {
+          matchQuery: all,
+          armLimit: DEFAULT_ARM_LIMIT,
+          finalLimit: 1,
+          scopeParams: assembled.params
+        })
+      )
+      return rows.length > 0
+    })
+
+  /**
+   * The query vector behind the coverage gate, with the coverage that decided it.
+   *
+   * ONE count statement per call, before any embedding. Below the floor the vector arm is dropped
+   * deliberately and the query is never embedded: a sparse plane ranks the embedded few above every
+   * lexical match (issue #141), so running the arm would make the result worse, and a Bedrock call for
+   * an arm that will not fire is waste. The warning names the counts and the remedy so an operator
+   * reading stderr learns which degradation this is, and it is logged only when an embedder is bound,
+   * because an embedder-less store at zero coverage is the deliberate lexical-only configuration.
+   */
+  const gatedQueryVector = (query: string) =>
+    Effect.gen(function* () {
+      const coverage = yield* readVectorCoverage(db, deps.embedWatermark)
+      if (coverage.coverage < coverageFloor) {
+        if (deps.embeddings !== undefined) {
+          yield* Effect.logWarning(
+            `retrieval: lexical floor, vector coverage ${formatCoverage(coverage.coverage)} (${coverage.embeddings} of ${coverage.chunks} chunks) is below ${coverageFloor}; ${VECTOR_COVERAGE_REMEDY}`
+          )
+        }
+        return { vector: undefined, coverage: coverage.coverage }
+      }
+      return { vector: yield* queryVector(query), coverage: coverage.coverage }
+    })
+
   /**
    * Run the fold and return fused paths, best first.
    *
@@ -229,10 +334,24 @@ export const makeRetrieval = (deps: RetrievalDeps): RetrievalShape => {
       /**
        * The MATCH text, not the caller's prose. Several forms that appear in ordinary agent queries
        * are HARD driver errors rather than empty results: an apostrophe, a `type:name` entity
-       * reference, a leading hyphen. So the query is reduced to indexable terms and the lexical arm
+       * reference, a leading hyphen. So the query is reduced to indexable terms, and the lexical arm
        * is dropped entirely when nothing survives.
+       *
+       * Two forms, all-terms first. FTS5 reads space-separated terms as AND and returns a file only
+       * when it holds every one, so a natural-language sentence that is not a verbatim quote of stored
+       * text gets zero lexical rows and the arm contributes nothing (issue #143). The any-of form
+       * always answers and bm25 still ranks the all-terms file first, but the arm then hands the
+       * fold 40 candidates instead of a few, and RRF's flat `1/(rank + 60)` lets recency and salience
+       * decide among them, which the discrimination gate measured as corpus MRR falling from 1.0 to
+       * 0.28. So the arm binds the all-terms form when some file in scope satisfies it, and the
+       * any-of form otherwise. The probe is one indexed `LIMIT 1` statement and is skipped when the
+       * two forms are the same string (one term, or none).
        */
-      const matchQuery = sanitizeFtsQuery(input.query)
+      const forms = ftsQueryForms(input.query)
+      const matchQuery =
+        forms.all === forms.any || (yield* holdsEveryTerm(forms.all, assembled))
+          ? forms.all
+          : forms.any
       const sql = buildRrfSql({
         hasQueryVector: input.vector !== undefined,
         hasState: db.hasState,
@@ -338,6 +457,42 @@ export const makeRetrieval = (deps: RetrievalDeps): RetrievalShape => {
     })
 
   /** Decode a stored float32 blob. Cheaper than `vector_extract` and the only reader of the layout. */
+  /**
+   * The archived rows a scope matches, for the `scopeEmpty` pointer.
+   *
+   * The same `assembleScope` the arms use, with the archived flag flipped rather than a second
+   * predicate written by hand: `includeArchived: true` drops the `archived = 0` condition and the
+   * `WHERE` here adds `archived = 1`, so the scope axes are byte-for-byte the ones that emptied the
+   * search. `asOf` is dropped for the same reason `scopeNarrows` ignores it: the question is whether
+   * the address resolves at all. The four leading slots are unbound (`?1`–`?4` belong to the fused
+   * statement's query, limits, and vector) so the scope's `?5`-onward placeholders bind unchanged.
+   */
+  const archivedInScope = (scope: SearchScope, limit: number) =>
+    Effect.gen(function* () {
+      const assembled = assembleScope({ ...scope, includeArchived: true, asOf: undefined })
+      const limitSlot = PARAM_QUERY_VECTOR + assembled.params.length + 1
+      // At least one row, or `LIMIT 0` returns nothing and the window count is lost with it: a caller
+      // asking for zero hits still gets a true `archivedMatches`.
+      const bounded = Math.max(1, limit)
+      const rows = yield* db.all<{ path: string; superseded_by: string | null; total: number }>(
+        `SELECT f.path AS path,
+                (SELECT g.src_path FROM edges g
+                  WHERE g.dst_path = f.path AND g.edge_class = 'memory'
+                    AND g.rel = 'supersedes' AND g.derived = 0
+                  ORDER BY g.created_at DESC, g.src_path ASC LIMIT 1) AS superseded_by,
+                COUNT(*) OVER () AS total
+         FROM files f
+         WHERE f.archived = 1${assembled.holes.fileFilter.replaceAll("{alias}", "f")}
+         ORDER BY f.path ASC
+         LIMIT ?${limitSlot}`,
+        [null, null, null, null, ...assembled.params, bounded]
+      )
+      return {
+        archivedMatches: rows[0]?.total ?? 0,
+        archived: rows.map((row) => ({ path: row.path, supersededBy: row.superseded_by }))
+      }
+    })
+
   const decodeVector = (blob: Uint8Array | null): ReadonlyArray<number> | undefined => {
     if (blob === null || blob.byteLength === 0 || blob.byteLength % 4 !== 0) return undefined
     const copy = Uint8Array.from(blob)
@@ -347,7 +502,8 @@ export const makeRetrieval = (deps: RetrievalDeps): RetrievalShape => {
   const search = (input: SearchInput) =>
     Effect.gen(function* () {
       const limit = input.limit ?? DEFAULT_SEARCH_LIMIT
-      const vector = yield* queryVector(input.query)
+      const gated = yield* gatedQueryVector(input.query)
+      const vector = gated.vector
       const fused = yield* fuse({
         query: input.query,
         scope: input,
@@ -361,11 +517,20 @@ export const makeRetrieval = (deps: RetrievalDeps): RetrievalShape => {
        * rank-derived and incomparable across queries, so a monotone substitute is the right input.
        * MMR only needs the ORDER to be right, and reciprocal position preserves it while keeping the
        * penalty term on a comparable scale to the relevance term.
+       *
+       * The polarity step (`polarity.ts`) sits between the two: it assigns that reciprocal-rank score
+       * and then demotes any negation-flipped twin of a better-agreeing candidate. It runs here, on
+       * the hydrated pool, because it needs each candidate's claim text and vector, neither of which
+       * the fused SQL carries.
        */
-      const candidates: ReadonlyArray<MmrCandidate> = rows.map((row, offset) => ({
+      const scored = polarityScored(
+        input.query,
+        rows.map((row) => ({ ...row, vector: decodeVector(row.vec) }))
+      )
+      const candidates: ReadonlyArray<MmrCandidate> = scored.map(({ row, score }) => ({
         path: row.path,
-        score: 1 / (offset + 1),
-        vector: decodeVector(row.vec)
+        score,
+        vector: row.vector
       }))
       const ordered = applyMmr(candidates, limit, MMR_LAMBDA)
       const byPath = new Map(rows.map((row) => [row.path, row]))
@@ -377,6 +542,16 @@ export const makeRetrieval = (deps: RetrievalDeps): RetrievalShape => {
         ordered.map((candidate) => candidate.path),
         vector
       )
+      const scopeEmpty = ordered.length === 0 && scopeNarrows(input)
+      /**
+       * Under `asOf` the archived flag is not what emptied the search: the point-in-time lens already
+       * admits archived rows and excludes by validity instead, so a count of archived rows would name
+       * records that did not exist at the asked instant. The pointer stays at the zero shape there.
+       */
+      const pointer =
+        scopeEmpty && (input.asOf === undefined || input.asOf === "")
+          ? yield* archivedInScope(input, limit)
+          : { archivedMatches: 0, archived: [] as ReadonlyArray<ArchivedMatch> }
 
       return {
         hits: ordered.flatMap((candidate) => {
@@ -404,6 +579,7 @@ export const makeRetrieval = (deps: RetrievalDeps): RetrievalShape => {
               ]
         }),
         degraded: vector === undefined,
+        vectorCoverage: gated.coverage,
         arms: armNamesIn(fused.sql),
         entityScope: input.entity === undefined || input.entity === "" ? null : input.entity,
         /**
@@ -411,21 +587,29 @@ export const makeRetrieval = (deps: RetrievalDeps): RetrievalShape => {
          * A scope that admitted candidates which MMR then dropped is not an empty scope. No branch
          * here widens anything, and the flag is the whole response to an over-narrow scope.
          */
-        scopeEmpty: ordered.length === 0 && scopeNarrows(input)
+        scopeEmpty,
+        archivedMatches: pointer.archivedMatches,
+        archived: pointer.archived
       }
     }).pipe(Effect.withSpan("retrieval.search"))
 
   const recall = (input: RecallInput) =>
     Effect.gen(function* () {
       const budget = input.budgetChars ?? MEMORY_BODY_BUDGET
-      const vector = yield* queryVector(input.query)
+      const gated = yield* gatedQueryVector(input.query)
+      const vector = gated.vector
       const fused = yield* fuse({
         query: input.query,
         scope: input,
         limit: DEFAULT_SEARCH_LIMIT * MMR_POOL_FACTOR,
         vector
       })
-      const rows = yield* hydrate(fused.paths)
+      // The same polarity step `search` applies, so a recall pack and a search over one query agree
+      // on which of two flipped twins comes first.
+      const rows = polarityScored(
+        input.query,
+        (yield* hydrate(fused.paths)).map((row) => ({ ...row, vector: decodeVector(row.vec) }))
+      ).map(({ row }) => row)
 
       const candidates = rows.map(
         (row): DisclosureCandidate => ({
@@ -458,7 +642,8 @@ export const makeRetrieval = (deps: RetrievalDeps): RetrievalShape => {
         memories,
         spentChars: arcs.spentChars + memories.spentChars,
         truncated: arcs.truncated || memories.truncated,
-        degraded: vector === undefined
+        degraded: vector === undefined,
+        vectorCoverage: gated.coverage
       }
     }).pipe(Effect.withSpan("retrieval.recall"))
 

@@ -79,15 +79,16 @@ export const phaseIndexOf = (phase: SleepPhase): number => SLEEP_PHASES.indexOf(
  * twelve that had already succeeded.
  *
  * **`preflight` gates the WHOLE run: every one of the sixteen phases after it.** It establishes the
- * three preconditions the rest of the night reads, and each of its failures makes every later phase's
+ * four preconditions the rest of the night reads, and each of its failures makes every later phase's
  * commit wrong rather than merely unhelpful. `requireCleanTree` failing means the operator has
  * uncommitted work in the tree, so a later phase stages and commits the operator's bytes under
  * sleep's own trailers. `EmbedModelMismatch` is a half-migrated vector space, which degrades every
  * cosine in the run while each individual vector stays well-formed — dedup, mining, and conflict
  * detection all come back plausible and wrong. `IndexStale` is an index a rebuild emptied and did not
  * finish repopulating, and every later phase reads the index, so their counts describe a corpus
- * fragment. All three end in the one outcome per-phase isolation is not a defense against: a corrupt
- * night with a green report.
+ * fragment. `VectorCoverageLow` is a vector plane covering under half the chunks, so every cosine
+ * pass compares a sample of the corpus against itself and calls the rest unique. All four end in the
+ * one outcome per-phase isolation is not a defense against: a corrupt night with a green report.
  *
  * `dedup-merge` gates `compress` and `retention-triage`: both operate on the post-merge set, and
  * running them over a corpus that still holds the duplicates would compress a near-duplicate pair
@@ -258,6 +259,36 @@ export interface PhaseResult {
   readonly detail?: string | undefined
 }
 
+/**
+ * How long a `sleep_runs` row may stay `running` before a later run treats it as killed.
+ *
+ * Twenty hours. This bounds how long ONE run can still plausibly be executing; it says nothing about
+ * when the next run comes, because the cycle has no schedule of its own and a caller decides that. A
+ * run writes its row `running` before the first phase and rewrites it after the last, and a process
+ * killed in between leaves the first write in place with nothing else ever revisiting it (issue
+ * #146). No phase budget bounds a whole run's wall-clock duration (the caps in this package count
+ * model calls and detected tasks), so the bound is stated here. A full run over the production corpus
+ * is a multi-hour process, and twenty hours is several times that.
+ *
+ * Why twenty and not a round day: the RUNBOOK's example wiring runs `sleep run` once a day, and a bound
+ * equal to that interval turns the boundary into a coin flip. Measured: a run started at 02:00:07 and a
+ * next start at 02:00:03 the following day are 86,396,000 ms apart, which is under a 24-hour bound by
+ * four seconds, so the killed row survives one more day. Four hours of margin absorb cron drift and a
+ * host that booted late, so a once-a-day caller always reaps the previous run on the next start.
+ *
+ * The comparison is between two wall-clock stamps of the same kind, the stuck row's `started_at` and
+ * the new run's own start. The run's `--date` parameter is the wrong reference: a backdated run would
+ * make every earlier row read as far older or far younger than it is.
+ */
+export const SLEEP_RUN_STALE_AFTER_MS = 20 * 60 * 60 * 1000
+
+/** One earlier run's row the reaper closed at the start of this run, and why. */
+export interface ReapedRun {
+  readonly runId: string
+  /** `branch gone`, or `started <n>h ago, past budget`. */
+  readonly reason: string
+}
+
 /** A whole run's outcome. */
 export interface RunReport {
   /** `sleep/<YYYY-MM-DD>`, suffixed `-2` on a same-day rerun. Also the branch name. */
@@ -271,6 +302,12 @@ export interface RunReport {
   readonly phases: ReadonlyArray<PhaseResult>
   /** Total model calls across {@link LLM_PHASES}. */
   readonly llmCalls: number
+  /**
+   * Rows of EARLIER runs this run stamped `abandoned` before it started, with the reason for each.
+   * Empty on a resume, which targets a `running` row on purpose, and on a run that refused to start
+   * before it reached the ledger.
+   */
+  readonly reaped: ReadonlyArray<ReapedRun>
 }
 
 /** How one file changed across a run, for the review surface. */
@@ -325,7 +362,8 @@ export interface MergeReport {
    * Present only on a merge that happened; a refusal applies nothing and reports neither.
    *
    * TWO numbers rather than one, and they answer different questions. `marksPending` is what the
-   * branch earned, `marksApplied` is what the plane took. They agree on every ordinary merge, so a
+   * branch earned, `marksApplied` is what the plane took. A record kind (`commitment-below-floor`)
+   * counts as applied by having reached `main`; it writes no row. They agree on every ordinary merge, so a
    * merge where they disagree is the operator-visible reading of a plane write that did not land —
    * the sessions in the shortfall stay unconsolidated and are re-read on the next cycle, which costs
    * a model call and loses nothing. One number could not distinguish that from a run that earned no
@@ -333,6 +371,35 @@ export interface MergeReport {
    */
   readonly marksPending?: number | undefined
   readonly marksApplied?: number | undefined
+  /**
+   * Whether this merge projected the merged commit into the index (issue #145). Present only on a
+   * merge that happened; a refusal moves nothing and so has nothing to project.
+   *
+   * The index is a projection of ONE commit, and the merge made a new one, so a merge is not
+   * finished until `index_state.head_sha` names `headSha`. `true` means it does, and every memory
+   * the run distilled, rewrote, or archived is searchable when the command returns. `false` means
+   * `main` moved and the index did not follow: `indexError` says why, and the WARN on stderr names
+   * the recovery (`memhtml index rebuild --embed` for a stale index or a mixed vector space,
+   * `memhtml index update --embed` otherwise). The merge itself is never failed over an index the
+   * operator can rebuild, for the reason `marksApplied` follows: `main` has already moved.
+   */
+  readonly indexUpdated?: boolean | undefined
+  /** The commit the index describes after the update. Equals `headSha` when `indexUpdated`. */
+  readonly indexHeadSha?: string | undefined
+  /** The incremental pass's counts, the same numbers `memhtml index update` reports. */
+  readonly indexAdded?: number | undefined
+  readonly indexModified?: number | undefined
+  readonly indexRemoved?: number | undefined
+  readonly indexRenamed?: number | undefined
+  readonly embeddingsWritten?: number | undefined
+  /**
+   * Files the update could not project, the same count preflight reports. Each is on `main` and
+   * absent from the index, so a non-zero value beside `indexUpdated: true` is a merged memory nobody
+   * can search; the paths are in the log and `memhtml doctor` names the defect.
+   */
+  readonly indexSkipped?: number | undefined
+  /** Why the index did not follow `main`, when `indexUpdated` is false. */
+  readonly indexError?: string | undefined
 }
 
 /**
@@ -390,6 +457,34 @@ export type PendingMark =
       readonly canonicalName: string
       readonly at: string
     }
+  /**
+   * A commitment the consolidator extracted that scored below `COMMITMENT_FLOOR`, kept whole.
+   *
+   * A RECORD rather than a deferred write: nothing in the state plane changes when `merge` applies it,
+   * and {@link isStateWriteMark} is what keeps it out of `applyPendingMarks`' statement list. It lives
+   * in the ledger anyway because the ledger is the run's committed, reviewable, branch-scoped record,
+   * and "did not act" and "did not record" are different decisions. The floor exists so a
+   * low-confidence commitment does not mint a task on its own; without the text, the confidence, and
+   * the session beside the count, an operator reading `commitmentsBelowFloor=2` cannot tell a floor
+   * that was rightly conservative from one that dropped a real commitment, and the floor is untunable
+   * (issue #131). The report renders these under a fold; a later run or an operator can re-score them.
+   */
+  | {
+      readonly kind: "commitment-below-floor"
+      readonly sessionId: string
+      readonly statement: string
+      readonly confidence: number
+      readonly resolved: boolean
+      readonly runId: string
+      readonly at: string
+    }
+
+/** The marks that perform a state-plane write when applied. Everything but the record kinds. */
+export type StateWriteMark = Exclude<PendingMark, { readonly kind: "commitment-below-floor" }>
+
+/** True for a mark `merge` executes as SQL; false for a record it carries and applies as nothing. */
+export const isStateWriteMark = (mark: PendingMark): mark is StateWriteMark =>
+  mark.kind !== "commitment-below-floor"
 
 /**
  * Where a run's ledger lives: beside its report, under the same run-id-to-filename rule.
@@ -415,6 +510,16 @@ const renderPendingMark = (mark: PendingMark): string => {
       return JSON.stringify({
         kind: mark.kind,
         sessionId: mark.sessionId,
+        runId: mark.runId,
+        at: mark.at
+      })
+    case "commitment-below-floor":
+      return JSON.stringify({
+        kind: mark.kind,
+        sessionId: mark.sessionId,
+        statement: mark.statement,
+        confidence: mark.confidence,
+        resolved: mark.resolved,
         runId: mark.runId,
         at: mark.at
       })
@@ -522,6 +627,20 @@ const parseOne = (line: string): PendingMark | undefined => {
     return entityType === undefined || aliasName === undefined || canonicalName === undefined
       ? undefined
       : { kind: "entity-promoted", entityType, aliasName, canonicalName, at }
+  }
+  if (fields.kind === "commitment-below-floor") {
+    const sessionId = text(fields.sessionId)
+    const statement = text(fields.statement)
+    const runId = text(fields.runId)
+    const { confidence, resolved } = fields
+    return sessionId === undefined ||
+      statement === undefined ||
+      runId === undefined ||
+      typeof confidence !== "number" ||
+      !Number.isFinite(confidence) ||
+      typeof resolved !== "boolean"
+      ? undefined
+      : { kind: "commitment-below-floor", sessionId, statement, confidence, resolved, runId, at }
   }
   return undefined
 }

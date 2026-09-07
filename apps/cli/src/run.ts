@@ -9,7 +9,7 @@ import { parseFacetFilters } from "@memhtml/index"
 import { initRepo } from "@memhtml/store"
 import { layerTelemetry } from "@memhtml/telemetry"
 import { Effect, type Layer, Logger } from "effect"
-import { runAgentsDoc } from "./agents-doc.js"
+import { renderAgentsDoc, runAgentsDoc } from "./agents-doc.js"
 import { Git, Indexer, layerApp, Sleep } from "./api-layer.js"
 import { applyPayload, applyText, decodeApply, readStdin } from "./apply.js"
 import {
@@ -20,7 +20,7 @@ import {
   type FlagSpec,
   GLOBAL_FLAGS
 } from "./commands.js"
-import { MemhtmlRoot } from "./config.js"
+import { MemhtmlRoot, REFUSE_ENV_ROOT_VAR, refusesEnvRoot } from "./config.js"
 import { doctor } from "./doctor.js"
 import {
   API_VERSION,
@@ -36,6 +36,7 @@ import {
 } from "./envelope.js"
 import { failureFor } from "./errors.js"
 import { DEFAULT_TIMEOUT_MS, execCommand, MAX_TIMEOUT_MS, readScript } from "./exec.js"
+import { helpData, renderCommandHelp } from "./help.js"
 import * as ops from "./operations.js"
 import { publish } from "./publish.js"
 import { serveMcp } from "./serve.js"
@@ -138,6 +139,14 @@ export const parseArgv = (argv: ReadonlyArray<string>): Parsed => {
   let index = 0
   while (index < argv.length) {
     const token = argv[index] as string
+    // The one short flag. `-h` is what a person types before reading anything, so it is spelled the
+    // way every other CLI spells it; it is `--help` and nothing else, since a positional `-h` would
+    // otherwise become a command name and answer ERR_UNKNOWN_COMMAND to a request for help.
+    if (token === "-h") {
+      push("help", true)
+      index += 1
+      continue
+    }
     if (token.startsWith("--")) {
       const body = token.slice(2)
       const eq = body.indexOf("=")
@@ -552,8 +561,18 @@ const dispatch = (
     case "index rebuild":
       return Effect.gen(function* () {
         const indexer = yield* Indexer
-        const report = yield* indexer.rebuild({ embed: bool(parsed, "embed", true) })
+        const report = yield* indexer.rebuild({
+          embed: bool(parsed, "embed", true),
+          force: bool(parsed, "force", false)
+        })
         return ["index.report", { mode: "rebuild", ...report }] as const
+      })
+
+    case "index embed":
+      return Effect.gen(function* () {
+        const indexer = yield* Indexer
+        const report = yield* indexer.backfill({ dryRun: bool(parsed, "dry-run", false) })
+        return ["index.report", { mode: "embed", ...report }] as const
       })
 
     case "index update":
@@ -1058,16 +1077,82 @@ const surplusArgs = (parsed: Parsed, spec: CommandSpec): Failure | undefined => 
 }
 
 /**
+ * The arms that resolve the repo root themselves, with no layer: `serve mcp` supervises a child over
+ * it and `exec` mounts a worktree of it. For them an injected layer is not a door to the root, so
+ * under {@link envRootRefusal} only `--repo` counts.
+ */
+const ROOT_WITHOUT_LAYER: ReadonlySet<string> = new Set(["serve mcp", "exec"])
+
+/**
+ * `MEMHTML_REFUSE_ENV_ROOT`: the environment is not a door to a repo.
+ *
+ * Every arm past the point this is called resolves a repo root, and without `--repo` that root is
+ * `MEMHTML_ROOT` or `~/memhtml`, read from the process environment. A test calling `run()`
+ * in-process, and any subprocess in an agent runtime that exports `MEMHTML_ROOT` to everything it
+ * starts, therefore reaches whatever store the environment names the moment an interception stops
+ * firing: issue #144 is a help mutant that rebuilt a live index exactly that way. With the variable
+ * set, the root has to come from `--repo` or from an injected layer, and a call that names neither is
+ * a usage error at exit 2, decided here before any service is built, so nothing is opened.
+ *
+ * `ERR_REPO_REQUIRED` rather than `ERR_MISSING_ARGUMENT`: the flag is optional on every command, so
+ * "missing" would name a rule the manifest does not state, and a caller branching on the code needs
+ * to learn one fact, that this environment wants `--repo`. The suggestions are the flag spelling and
+ * the command's help, the pointer every refusal of a known command ends with.
+ *
+ * An injected layer is the injector's statement of the root. `run()` cannot look inside a `Layer`, so
+ * a caller that built one from the environment (`layerApp()` with no repo) has walked through the
+ * door itself; the vitest pin and its teardown are the backstop for that case, not this guard.
+ *
+ * The guard runs before the arms' own input checks, so under the flag `exec` with a blank script and
+ * `apply` with a malformed file answer `ERR_REPO_REQUIRED` rather than their own usage codes. Both
+ * are exit 2 and both are fixed on the line; the repo question comes first because it is the one the
+ * flag exists to ask.
+ */
+const envRootRefusal = (
+  parsed: Parsed,
+  layer: Layer.Layer<DispatchServices> | undefined
+): Failure | undefined => {
+  if (!refusesEnvRoot()) return undefined
+  const override = str(parsed, "repo")
+  if (override !== undefined && override.trim() !== "") return undefined
+  if (layer !== undefined && !ROOT_WITHOUT_LAYER.has(parsed.command)) return undefined
+  return fail(
+    "ERR_REPO_REQUIRED",
+    `${parsed.command} opens a repo and ${REFUSE_ENV_ROOT_VAR} is set, so the root is not read from MEMHTML_ROOT or ~/memhtml: name it with --repo`,
+    [`memhtml ${parsed.command} --repo <path>`, `memhtml help ${parsed.command}`]
+  )
+}
+
+/** The suggestion every usage error on a known command ends with: the call that shows its table. */
+const helpFor = (spec: CommandSpec): string => `memhtml help ${spec.name}`
+
+/**
  * Validate a parsed invocation against its spec. Usage errors only; nothing here touches a service.
  *
  * Returning the failure rather than throwing keeps the exit code decision in one place. A usage
  * error is exit 2 and a runtime error is exit 1, and a validator that emitted its own envelope would
  * have to know that too.
  */
-const validate = (parsed: Parsed): Failure | undefined => {
+export const validate = (parsed: Parsed): Failure | undefined => {
   const spec = COMMANDS.find((command) => command.name === parsed.command)
   if (spec === undefined) return unknownCommand(parsed)
+  const failure = validateAgainst(parsed, spec)
+  if (failure === undefined) return undefined
+  /**
+   * Every refusal of a KNOWN command ends with that command's help, appended here once rather than
+   * in each of the dozen arms below, so a new arm cannot forget it. The first wrong invocation should
+   * lead to the flag table rather than to the whole manifest, and a refusal whose own suggestions are
+   * empty (a closed-vocabulary miss with no near spelling) is no longer a dead end. An unknown
+   * command has no table to point at and keeps its nearest-name candidates alone.
+   */
+  const pointer = helpFor(spec)
+  return failure.suggestions.includes(pointer)
+    ? failure
+    : { ...failure, suggestions: [...failure.suggestions, pointer] }
+}
 
+/** The per-command rules, in order. Nothing here touches a service. */
+const validateAgainst = (parsed: Parsed, spec: CommandSpec): Failure | undefined => {
   /**
    * Flags are validated against THIS command's spec plus the true globals, not the union of every
    * command's flags. A flag that is valid somewhere else is still a usage error here: an agent that
@@ -1168,6 +1253,112 @@ const validate = (parsed: Parsed): Failure | undefined => {
 }
 
 /**
+ * `memhtml help [command]`, `memhtml <command> --help`, and `-h`: describe, never run.
+ *
+ * Answered before {@link validate} and before any layer is built, for the same reason `manifest` is:
+ * help has to work on a machine with no repo, and a caller asking how to call a command has not
+ * called it. `--help` therefore wins over every other flag on the line — `memhtml search --type x
+ * --help` describes `search` and ignores `--type` — and the flags kept are only the ones help itself
+ * declares, so the spelled-out form `memhtml help search --limit 5` is still refused as an unknown
+ * flag of `help`.
+ *
+ * Two output shapes, chosen by one rule. When stdout is a terminal and `--json` is absent, a person
+ * is reading, and the answer is Markdown. Otherwise — a pipe, a file, a test, or `--json` — a
+ * program is reading, and the answer is the `cli.help` envelope (or `cli.manifest` when no command
+ * was named). `--json` wins over the terminal check so a script can never receive prose by accident,
+ * and it is the ONLY command whose stdout can be something other than an envelope, which is why the
+ * flag lives on this command and not on the globals.
+ *
+ * An unknown command is the usual `ERR_UNKNOWN_COMMAND`, exit 2, with the same nearest-name
+ * suggestions a mistyped invocation gets: help for a command that does not exist is a usage error,
+ * not an empty page.
+ */
+const help = (
+  parsed: Parsed,
+  stdoutIsTTY: boolean,
+  emit: (payload: Success<unknown> | Failure, exitCode: number) => RunResult
+): RunResult => {
+  const spelledOut = parsed.command === "help"
+  // `memhtml help --help` describes help itself; `memhtml help` alone is the whole manifest.
+  const words = spelledOut
+    ? parsed.positional.length === 0 && bool(parsed, "help", false)
+      ? ["help"]
+      : parsed.positional
+    : parsed.command === ""
+      ? []
+      : parsed.command.split(" ")
+  const HELP_FLAGS: ReadonlySet<string> = new Set(["help", "json", "dense", "repo"])
+  const flags = spelledOut
+    ? parsed.flags
+    : new Map([...parsed.flags].filter(([name]) => HELP_FLAGS.has(name)))
+  const invalid = validate({
+    command: "help",
+    positional: spelledOut ? parsed.positional : [],
+    flags,
+    // The strays the kept flags carry stay: `memhtml search --help false` is the inverted ask the
+    // parser recorded it as, and dropping the record here would make the flag form accept what the
+    // spelled-out form refuses.
+    strayBooleanValues: spelledOut
+      ? parsed.strayBooleanValues
+      : parsed.strayBooleanValues.filter(([name]) => HELP_FLAGS.has(name))
+  })
+  if (invalid !== undefined) return emit(invalid, EXIT_USAGE)
+
+  const markdown = stdoutIsTTY && !bool(parsed, "json", false)
+  const asMarkdown = (text: string): RunResult => ({
+    stdout: text.replace(/\n$/, ""),
+    exitCode: EXIT_OK
+  })
+
+  const target = words.join(" ")
+  if (target === "") {
+    return markdown
+      ? asMarkdown(renderAgentsDoc())
+      : emit(succeed("cli.manifest", buildManifest()), EXIT_OK)
+  }
+  const spec = COMMANDS.find((command) => command.name === target)
+  if (spec === undefined) {
+    // What the caller typed, whole. The flag form keeps its own positionals here, so
+    // `memhtml index rebuil --help` is judged as `index rebuil`, the same text the typo alone is.
+    const typedWords = spelledOut ? words : [...words, ...parsed.positional]
+    const typed = typedWords.join(" ")
+    // A known command followed by a word that is not part of any name: surplus, not unknown, the same
+    // code `memhtml read a b` answers, naming the token so the caller drops it.
+    const prefix = COMPOUND_NAMES.find((name) => typed.startsWith(`${name} `))
+    const known = prefix ?? COMMAND_NAMES.find((name) => name === typedWords[0])
+    if (known !== undefined) {
+      const extra = typedWords.slice(known.split(" ").length)
+      return emit(
+        fail(
+          "ERR_UNEXPECTED_ARGUMENT",
+          `unexpected argument: ${extra.map((token) => `"${token}"`).join(", ")}. help describes one command: ${known}`,
+          [`memhtml help ${known}`]
+        ),
+        EXIT_USAGE
+      )
+    }
+    // A noun alone (`memhtml help index`) is an ask about a family, and the family is the answer.
+    // `nearest()` cannot offer it: every `index …` name is too far from `index` by edit distance.
+    const family = COMMAND_NAMES.filter((name) => name.startsWith(`${typed} `))
+    if (family.length > 0) {
+      return emit(fail("ERR_UNKNOWN_COMMAND", `unknown command: ${typed}`, family), EXIT_USAGE)
+    }
+    return emit(
+      unknownCommand({
+        command: typedWords[0] ?? "",
+        positional: typedWords.slice(1),
+        flags,
+        strayBooleanValues: []
+      }),
+      EXIT_USAGE
+    )
+  }
+  return markdown
+    ? asMarkdown(renderCommandHelp(spec))
+    : emit(succeed("cli.help", helpData(spec)), EXIT_OK)
+}
+
+/**
  * Returns the rendered envelope and an exit code rather than writing to the process, so tests
  * assert on the exact bytes an agent would parse.
  *
@@ -1182,7 +1373,8 @@ const validate = (parsed: Parsed): Failure | undefined => {
 export const run = async (
   argv: ReadonlyArray<string>,
   layer?: Layer.Layer<DispatchServices>,
-  stdin: () => Promise<string> = readStdin
+  stdin: () => Promise<string> = readStdin,
+  stdoutIsTTY: boolean = process.stdout.isTTY === true
 ): Promise<RunResult> => {
   const parsed = parseArgv(argv)
   const dense = bool(parsed, "dense", false)
@@ -1203,9 +1395,13 @@ export const run = async (
   const causeFailure = (cause: unknown): RunResult =>
     emit(fail("ERR_UNKNOWN", `unexpected failure: ${String(cause)}`, []), EXIT_RUNTIME)
 
-  if (parsed.command === "" || parsed.command === "help") {
-    return emit(succeed("cli.manifest", buildManifest()), EXIT_OK)
+  // Before the bare-invocation check: `memhtml --help` and `memhtml -h` parse to an empty command
+  // with the flag set, and they are asks for help, not liveness probes.
+  if (parsed.command === "help" || bool(parsed, "help", false)) {
+    return help(parsed, stdoutIsTTY, emit)
   }
+
+  if (parsed.command === "") return emit(succeed("cli.manifest", buildManifest()), EXIT_OK)
 
   const invalid = validate(parsed)
   if (invalid !== undefined) return emit(invalid, EXIT_USAGE)
@@ -1238,37 +1434,7 @@ export const run = async (
   }
 
   /**
-   * `serve mcp` must not build the app layer either, and here the reason is the database.
-   *
-   * The supervisor's only job is to spawn the server and wait. Building `layerApp` first would open
-   * `$MEMHTML_ROOT/.memhtml/index.db` and run its migrations in the parent. That is a second writer
-   * against the store the child exists to serve, held open for as long as the child lives, by a process
-   * that never issues a query. The parent needs the resolved repo root, which is config rather than a
-   * service.
-   *
-   * Nothing is emitted until the child exits, because stdout belongs to the child from the moment it
-   * is spawned. The `serve.exit` envelope describes how the server ended, and it is written after
-   * the descriptors are the parent's again.
-   */
-  if (parsed.command === "serve mcp") {
-    return Effect.runPromise(
-      Effect.gen(function* () {
-        const override = str(parsed, "repo")
-        const configured = yield* MemhtmlRoot
-        const memhtmlRoot =
-          override !== undefined && override.trim() !== "" ? override.trim() : configured
-        return yield* serveMcp(memhtmlRoot)
-      }).pipe(
-        Effect.map((data) => emit(succeed("serve.exit", data), EXIT_OK)),
-        Effect.catch((error) => Effect.succeed(emit(failureFor(error), EXIT_RUNTIME))),
-        Effect.catchCause((cause) => Effect.succeed(causeFailure(cause))),
-        Effect.provideService(Logger.LogToStderr, true)
-      )
-    )
-  }
-
-  /**
-   * `eval discriminate` does not build the app layer either, for the reason the command above gives.
+   * `eval discriminate` does not build the app layer either, for the reason `agents-doc` gives.
    * The gate measures the ranking stack against its own generated fixture corpus in a temp directory
    * with an in-memory database, and reads the operator's `index.db` not at all. Building `layerApp`
    * would open and migrate a store this command never queries, and an operator checking the gate is
@@ -1309,7 +1475,45 @@ export const run = async (
   }
 
   /**
-   * `memhtml exec` does not build the app layer either, for the reason two commands over.
+   * From here down every arm resolves a repo root, and this is the one place the environment is
+   * refused as the source of it. Everything above answers without a repo and keeps working under
+   * `MEMHTML_REFUSE_ENV_ROOT`; everything below needs `--repo` when it is set.
+   */
+  const refused = envRootRefusal(parsed, layer)
+  if (refused !== undefined) return emit(refused, EXIT_USAGE)
+
+  /**
+   * `serve mcp` must not build the app layer either, and here the reason is the database.
+   *
+   * The supervisor's only job is to spawn the server and wait. Building `layerApp` first would open
+   * `$MEMHTML_ROOT/.memhtml/index.db` and run its migrations in the parent. That is a second writer
+   * against the store the child exists to serve, held open for as long as the child lives, by a process
+   * that never issues a query. The parent needs the resolved repo root, which is config rather than a
+   * service.
+   *
+   * Nothing is emitted until the child exits, because stdout belongs to the child from the moment it
+   * is spawned. The `serve.exit` envelope describes how the server ended, and it is written after
+   * the descriptors are the parent's again.
+   */
+  if (parsed.command === "serve mcp") {
+    return Effect.runPromise(
+      Effect.gen(function* () {
+        const override = str(parsed, "repo")
+        const configured = yield* MemhtmlRoot
+        const memhtmlRoot =
+          override !== undefined && override.trim() !== "" ? override.trim() : configured
+        return yield* serveMcp(memhtmlRoot)
+      }).pipe(
+        Effect.map((data) => emit(succeed("serve.exit", data), EXIT_OK)),
+        Effect.catch((error) => Effect.succeed(emit(failureFor(error), EXIT_RUNTIME))),
+        Effect.catchCause((cause) => Effect.succeed(causeFailure(cause))),
+        Effect.provideService(Logger.LogToStderr, true)
+      )
+    )
+  }
+
+  /**
+   * `memhtml exec` does not build the app layer either, for the reason `serve mcp` gives.
    *
    * The command reads a git tree and nothing else. It materializes a commit as a detached worktree and
    * mounts that directory read-only. It never queries `index.db`, so building `layerApp` would open and

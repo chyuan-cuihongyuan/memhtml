@@ -44,7 +44,8 @@ export const RESPONSE_TYPES = [
   "exec.report",
   "entity.activity",
   "memory.resolved",
-  "sleep.plan"
+  "sleep.plan",
+  "cli.help"
 ] as const
 
 export type ResponseType = (typeof RESPONSE_TYPES)[number]
@@ -75,6 +76,9 @@ export const ERROR_CODES = [
   // offending token is not a flag, and distinct from `ERR_MISSING_ARGUMENT` because it is surplus
   // rather than absent: the caller drops a word instead of adding one.
   "ERR_UNEXPECTED_ARGUMENT",
+  // The call opens a repo, names none with `--repo`, and `MEMHTML_REFUSE_ENV_ROOT` forbids reading
+  // one from the environment. A usage code, since the fix is on the line rather than in the store.
+  "ERR_REPO_REQUIRED",
   "ERR_PATH_NOT_FOUND",
   "ERR_INVALID_MEMORY",
   "ERR_DUPLICATE_CONTENT",
@@ -86,7 +90,11 @@ export const ERROR_CODES = [
   "ERR_STORAGE",
   "ERR_GIT",
   "ERR_DISCRIMINATION_FAILED",
-  "ERR_UNKNOWN"
+  "ERR_UNKNOWN",
+  // `index rebuild --no-embed` over a store that carries vectors in the configured space, without
+  // `--force`. Exit 1: the call parsed, and the work was declined. Appended after `ERR_UNKNOWN`
+  // because the list is append-only and AGENTS.md prints it in this order.
+  "ERR_REBUILD_NO_EMBED_REFUSED"
 ] as const
 
 export type ErrorCode = (typeof ERROR_CODES)[number]

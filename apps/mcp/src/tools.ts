@@ -8,6 +8,7 @@ import {
   RESOLVE_STEP_VIA,
   RESOLVE_STOP_REASONS,
   Retrieval,
+  RetrievalPolicy,
   Store
 } from "@memhtml/cli"
 import { MEMORY_RELS } from "@memhtml/contracts/edges"
@@ -577,7 +578,7 @@ const MemoryRead = Tool.make("memory_read", {
 
 const MemorySearch = Tool.make("memory_search", {
   description:
-    "Ranked search over the corpus: lexical, vector, recency, and salience arms fused with RRF, then diversified. Each hit carries a `snippet`: the text of the file's best-matching chunk for this query (its opening chunk when the vector arm did not fire), truncated with a trailing `…` when cut. `degraded` is true when the vector arm did not fire, so the result came from fewer signals. Each hit also carries `entities` in `type:name` form; pass one of those values back as `entity` to make the next call the second hop of a chain. That is two calls, not a guess about spelling. An `entity` scope that matches nothing returns NO hits and says so through `scope_empty`: this tool never widens a scope it could not satisfy. `as_of` is a point-in-time view: pass an ISO instant and the result is what was believed valid at that moment, including since-superseded memories (marked superseded_by). Returning a path changes nothing: a hit is this ranker's guess, so it never bumps salience. Call memory_read to open the one you chose, and memory_reinforce to record whether it was right. " +
+    "Ranked search over the corpus: lexical, vector, recency, and salience arms fused with RRF, then diversified. Each hit carries a `snippet`: the text of the file's best-matching chunk for this query (its opening chunk when the vector arm did not fire), truncated with a trailing `…` when cut. `degraded` is true when the vector arm did not fire, so the result came from fewer signals; `vector_coverage` (the share of indexed chunks carrying a vector, 0 to 1) tells a sparse index, where the arm is dropped on purpose because a few embedded files would outrank every exact match, from an embedder outage. Each hit also carries `entities` in `type:name` form; pass one of those values back as `entity` to make the next call the second hop of a chain. That is two calls, not a guess about spelling. An `entity` scope that matches nothing returns NO hits and says so through `scope_empty`: this tool never widens a scope it could not satisfy. `as_of` is a point-in-time view: pass an ISO instant and the result is what was believed valid at that moment, including since-superseded memories (marked superseded_by). Returning a path changes nothing: a hit is this ranker's guess, so it never bumps salience. Call memory_read to open the one you chose, and memory_reinforce to record whether it was right. `query` is prose; a double-quoted span in it demands those words in that order, and nothing else is syntax. " +
     FACET_SCOPE_CONTRACT,
   dependencies: RETRIEVES(),
   parameters: Schema.Struct({
@@ -640,6 +641,13 @@ const MemorySearch = Tool.make("memory_search", {
       })
     ),
     degraded: Schema.Boolean,
+    /**
+     * The share of indexed chunks carrying a vector in the configured space, `0` to `1`, read once per
+     * call. Present in every result so a client can tell the two `degraded` causes apart: low here
+     * means the arm was dropped for a sparse index, high here with `degraded: true` means the
+     * embedder failed. The remedy for the first is `memhtml index embed`.
+     */
+    vector_coverage: Finite,
     arms: Schema.Array(Schema.String),
     /** The `entity` this search was scoped to, or `null` when it was not scoped by entity. */
     entity_scope: Schema.NullOr(Schema.String),
@@ -650,7 +658,20 @@ const MemorySearch = Tool.make("memory_search", {
      * result attributable to the scope, and it would be worth nothing if its absence had to be read
      * as `false`.
      */
-    scope_empty: Schema.Boolean
+    scope_empty: Schema.Boolean,
+    /**
+     * How many ARCHIVED memories the same scope matches, when `scope_empty` is true; `0` otherwise.
+     *
+     * The pointer behind an empty scope: eviction and compress move a file into `archive/` and the
+     * default scope excludes it, so a correct facet over a real record answers nothing. A non-zero
+     * count says the address resolves under `include_archived`, and `archived[].superseded_by` names
+     * what replaced each one. Present as a number in every case, like `scope_empty`.
+     */
+    archived_matches: Finite,
+    /** Up to `limit` of those archived paths, sorted, each with what superseded it or `null`. */
+    archived: Schema.Array(
+      Schema.Struct({ path: Schema.String, superseded_by: Schema.NullOr(Schema.String) })
+    )
   })
 })
 
@@ -689,7 +710,9 @@ const MemoryRecall = Tool.make("memory_recall", {
     }),
     spent_chars: Count,
     truncated: Schema.Boolean,
-    degraded: Schema.Boolean
+    degraded: Schema.Boolean,
+    /** The same ratio `memory_search` reports, for the same reason. */
+    vector_coverage: Finite
   })
 })
 
@@ -1105,8 +1128,9 @@ const TraceLinks = Tool.make("trace_links", {
 
 const MemoryStatus = Tool.make("memory_status", {
   description:
-    "Corpus health in one call: HEAD, dirty state, counts by type, edge totals, whether the index describes the current commit, and when sleep last ran.",
-  dependencies: [Store, DatabaseService],
+    "Corpus health in one call: HEAD, dirty state, counts by type, edge totals, whether the index describes the current commit, how much of the index the vector arm can see, and when sleep last ran.",
+  // `RetrievalPolicy` because the status names the coverage floor a search degrades at.
+  dependencies: [Store, DatabaseService, RetrievalPolicy],
   /**
    * `Tool.EmptyParams`, not `Schema.Struct({})`.
    *
@@ -1128,6 +1152,13 @@ const MemoryStatus = Tool.make("memory_status", {
     /** True when the index's watermark IS the current HEAD. A row count cannot answer this. */
     index_fresh: Schema.Boolean,
     embedder_up: Schema.Boolean,
+    /**
+     * The share of indexed chunks carrying a vector in the configured space, and the floor below which
+     * `memory_search` drops the vector arm. `embedder_up` is true from one vector onward; this is the
+     * number that says how much of the corpus the vector arm can see.
+     */
+    vector_coverage: Finite,
+    vector_coverage_floor: Finite,
     last_sleep: Schema.NullOr(
       Schema.Struct({
         run_id: Schema.String,

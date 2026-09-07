@@ -1429,6 +1429,107 @@ describe("search", () => {
     expect(cold.get(competitor)).toBeDefined()
   })
 
+  it("lifts a memory on the one proper noun a sentence names, ranked first on the lexical floor", async () => {
+    /**
+     * The corpus's OLDEST file, so recency and salience both rank it last and only the lexical arm
+     * can lift it. The query is a four-word sentence whose other three words appear in no file:
+     * FTS5 reads space-separated terms as AND, so a sanitizer that joins with spaces gives this
+     * sentence zero bm25 rows and the file stays at the bottom. `arms` still names `fts` either way,
+     * because the arm RAN; the rank is what says whether it contributed.
+     */
+    const orion = "areas/team/orion-standup-slot.html"
+    await repo.commit(
+      [
+        {
+          path: orion,
+          html: memoryHtml({
+            title: "Orion keeps the Tuesday standup slot",
+            claim: "Orion runs the Tuesday standup and owns its agenda.",
+            body: "Orion also keeps the notes for it.",
+            memoryType: "semantic",
+            updatedAt: "2026-05-01T00:00:00Z"
+          })
+        }
+      ],
+      "seed the proper noun"
+    )
+    const result = await withIndexed(
+      repo,
+      ({ retrieval }) => retrieval.search({ query: "what does orion own" }),
+      { queryEmbedder: null }
+    )
+    expect(result.degraded).toBe(true)
+    expect(result.arms).toContain("fts")
+    expect(result.hits.map((hit) => hit.path)[0]).toBe(orion)
+  })
+
+  /**
+   * The two MATCH forms, read off the statements retrieval itself issued. The bound `?1` of the fused
+   * statement is the only place the choice is observable: both forms return the target here, and a
+   * result assertion alone would pass against an arm that always bound one of them.
+   */
+  const issuedBy = (input: { readonly query: string; readonly tags?: ReadonlyArray<string> }) =>
+    withDb((db) =>
+      Effect.gen(function* () {
+        yield* indexInto(db, repo, makeFakeEmbedder())
+        const issued: Array<{ sql: string; params: ReadonlyArray<unknown> }> = []
+        const capturing: DatabaseShape = {
+          ...db,
+          all: (<A>(sql: string, params?: ReadonlyArray<unknown>) => {
+            issued.push({ sql, params: params ?? [] })
+            return (db.all as never as (s: string, p?: ReadonlyArray<unknown>) => Effect.Effect<A>)(
+              sql,
+              params
+            )
+          }) as DatabaseShape["all"]
+        }
+        const result = yield* makeRetrieval({ db: capturing }).search({ ...input, limit: 20 })
+        const fused = issued.find((statement) => statement.sql.includes("rrf AS ("))
+        return {
+          paths: result.hits.map((hit) => hit.path),
+          match: fused?.params[0],
+          probes: issued.filter((statement) => statement.sql.includes("AS hit")).length
+        }
+      })
+    )
+
+  it("binds the all-terms form when a file in scope holds every term, so the arm stays a filter", async () => {
+    const outcome = await issuedBy({ query: "drain the VIP before reverting the deploy" })
+    expect(outcome.probes).toBe(1)
+    expect(outcome.match).toBe("drain AND the AND vip AND before AND reverting AND the AND deploy")
+    expect(outcome.paths).toContain("areas/oncall/vip-drain-before-rollback.html")
+  })
+
+  it("falls back to the any-of form when no file holds every term", async () => {
+    // `pancakes` is in no file, so the all-terms form matches nothing and the sentence would get
+    // zero lexical rows; the any-of form is what lets the words it does share find the file.
+    const outcome = await issuedBy({ query: "drain the VIP before pancakes" })
+    expect(outcome.probes).toBe(1)
+    expect(outcome.match).toBe("drain OR the OR vip OR before OR pancakes")
+    expect(outcome.paths).toContain("areas/oncall/vip-drain-before-rollback.html")
+  })
+
+  it("issues no probe for a one-term query, whose two forms are one string", async () => {
+    const outcome = await issuedBy({ query: "drain" })
+    expect(outcome.probes).toBe(0)
+    expect(outcome.match).toBe("drain")
+  })
+
+  it("probes THROUGH the caller's scope, so an all-terms match outside it does not bind the all-terms form", async () => {
+    /**
+     * Every term is held by the oncall files, none of which carries the `bm25` tag. A probe that
+     * ignored the scope would see them, bind the all-terms form, and hand the fold a lexical arm that
+     * matches nothing the scope admits: the same silent nothing the fallback exists to end.
+     */
+    const outcome = await issuedBy({
+      query: "drain the VIP before reverting the deploy",
+      tags: ["bm25"]
+    })
+    expect(outcome.probes).toBe(1)
+    expect(outcome.match).toBe("drain OR the OR vip OR before OR reverting OR the OR deploy")
+    expect(outcome.paths).toEqual(["projects/memhtml/bm25-sort-direction.html"])
+  })
+
   it("is deterministic: the same query over an unchanged corpus yields the same order", async () => {
     const outcome = await withIndexed(repo, ({ retrieval }) =>
       Effect.gen(function* () {
@@ -1755,5 +1856,436 @@ describe("search: the facet scope", () => {
       (step) => step.includes("SCAN") && step.includes("file_facets")
     )
     expect(scans, `file_facets scanned: ${scans.join(" | ")}`).toEqual([])
+  })
+})
+
+describe("the polarity step between fusion and MMR", () => {
+  /**
+   * The wiring, end to end, over the offline embedder. A claim-only pair sits below `TWIN_COSINE`
+   * under the bag-of-words fake, so the twins share a body long enough to make them near-copies
+   * (measured 0.977 with a shared forty-word body), which is also the shape of a real flipped twin: the
+   * same memory with one word inverted. Asserted through BOTH entry points, since `recall` has no MMR
+   * and shows the order directly in its fold.
+   *
+   * The fixture is built so FUSION puts the flipped twin first: its claim carries two query terms the
+   * target's lacks (`streamfleet indexer`) and it is the newer file, so it leads the lexical, vector,
+   * and recency arms. Only the polarity step can move the target above it, which is what makes this
+   * a pin rather than a pass-through (bypassing the step in `retrieval.ts` fails it).
+   */
+  const SHARED_BODY =
+    "The analyzer chain runs after tokenization and before scoring. It reads the interval list the " +
+    "streamfleet indexer emits for each document, walks the list once in ordinal order, and writes the " +
+    "result back beside the document so the searcher never recomputes it at query time."
+
+  const twins = (): ReadonlyArray<SeedFile> => [
+    {
+      path: "resources/search/analyzer-chain-negated.html",
+      html: memoryHtml({
+        title: "The analyzer chain does not merge intervals",
+        claim:
+          "The analyzer chain does not merge five intervals per pass of the streamfleet indexer.",
+        body: SHARED_BODY,
+        memoryType: "semantic",
+        updatedAt: "2026-07-31T00:00:00Z"
+      })
+    },
+    {
+      path: "resources/search/analyzer-chain-merges.html",
+      html: memoryHtml({
+        title: "The analyzer chain merges intervals",
+        claim: "The analyzer chain merges five intervals per pass.",
+        body: SHARED_BODY,
+        memoryType: "semantic",
+        updatedAt: "2026-07-29T00:00:00Z"
+      })
+    },
+    ...corpus()
+  ]
+
+  let repo: FixtureRepo
+
+  beforeEach(async () => {
+    repo = await makeFixtureRepo()
+    await repo.commit(twins(), "seed the corpus with a flipped-twin pair")
+  })
+
+  afterEach(() => repo.cleanup())
+
+  it("ranks the target above its negation-flipped twin in search and in the recall fold", async () => {
+    const outcome = await withIndexed(repo, ({ retrieval }) =>
+      Effect.gen(function* () {
+        const query = "analyzer chain five intervals per pass streamfleet indexer"
+        const found = yield* retrieval.search({ query, limit: 10 })
+        const pack = yield* retrieval.recall({ query })
+        return {
+          hits: found.hits.map((hit) => hit.path),
+          fold: pack.memories.disclosed.map((entry) => entry.path)
+        }
+      })
+    )
+    const target = "resources/search/analyzer-chain-merges.html"
+    const flipped = "resources/search/analyzer-chain-negated.html"
+    expect(outcome.hits).toContain(target)
+    expect(outcome.hits).toContain(flipped)
+    expect(outcome.hits.indexOf(target)).toBeLessThan(outcome.hits.indexOf(flipped))
+    expect(outcome.fold).toContain(target)
+    expect(outcome.fold.indexOf(target)).toBeLessThan(outcome.fold.indexOf(flipped))
+  })
+})
+
+describe("the archived pointer behind an empty scope", () => {
+  /**
+   * Issue #130: a sleep run's compress folded two daily journals into a canonical and archived both, and a
+   * faceted search over a real record then answered `hits: []`, `scopeEmpty: true`, and nothing about
+   * why. The pointer is the count of archived rows the SAME scope matches plus, per row, what
+   * superseded it, so an agent can follow the canonical or retry with `includeArchived` instead of
+   * concluding the record never existed.
+   */
+  const JOURNAL = "archive/2026/areas/journal/2026-09-02.html"
+  const CANONICAL = "areas/journal/journals-days-1-2.html"
+
+  const journals = (): ReadonlyArray<SeedFile> => [
+    {
+      path: JOURNAL,
+      html: memoryHtml({
+        title: "Journal for 2026-09-02",
+        claim: "Spent the day moving the analyzer chain behind the streamfleet indexer.",
+        memoryType: "episodic",
+        status: "archived",
+        archivedAt: "2026-09-03T03:00:00Z",
+        updatedAt: "2026-09-03T03:00:00Z",
+        facets: [
+          { name: "doc-type", value: "daily-journal" },
+          { name: "day", value: "2026-09-02" }
+        ]
+      })
+    },
+    {
+      path: CANONICAL,
+      html: memoryHtml({
+        title: "Journals, days 1 to 2",
+        claim: "Two days went to the analyzer chain and the streamfleet indexer.",
+        memoryType: "semantic",
+        updatedAt: "2026-09-03T03:00:00Z",
+        links: [{ rel: "memhtml-supersedes", href: `/${JOURNAL}` }]
+      })
+    },
+    ...corpus()
+  ]
+
+  let repo: FixtureRepo
+
+  beforeEach(async () => {
+    repo = await makeFixtureRepo()
+    await repo.commit(journals(), "seed a compressed journal")
+  })
+
+  afterEach(() => repo.cleanup())
+
+  it("counts the archived rows the scope matches and names what superseded each", async () => {
+    const outcome = await withIndexed(repo, ({ retrieval }) =>
+      Effect.gen(function* () {
+        const scoped = yield* retrieval.search({
+          query: "yesterday's journal",
+          facets: [
+            { name: "doc-type", value: "daily-journal" },
+            { name: "day", value: "2026-09-02" }
+          ],
+          limit: 10
+        })
+        // The same scope, widened the way the pointer suggests: the record is there.
+        const widened = yield* retrieval.search({
+          query: "yesterday's journal",
+          facets: [{ name: "day", value: "2026-09-02" }],
+          includeArchived: true,
+          limit: 10
+        })
+        return { scoped, widened: widened.hits.map((hit) => hit.path), widenedResult: widened }
+      })
+    )
+    expect(outcome.scoped.hits).toEqual([])
+    expect(outcome.scoped.scopeEmpty).toBe(true)
+    expect(outcome.scoped.archivedMatches).toBe(1)
+    expect(outcome.scoped.archived).toEqual([{ path: JOURNAL, supersededBy: CANONICAL }])
+    expect(outcome.widened).toContain(JOURNAL)
+    // Not empty, so no pointer: the fields are the zero shape rather than absent.
+    expect(outcome.widenedResult.scopeEmpty).toBe(false)
+    expect(outcome.widenedResult.archivedMatches).toBe(0)
+    expect(outcome.widenedResult.archived).toEqual([])
+  })
+
+  it("reports zero when the scope matches nothing archived either, so a missing record reads as missing", async () => {
+    const outcome = await withIndexed(repo, ({ retrieval }) =>
+      retrieval.search({
+        query: "yesterday's journal",
+        facets: [{ name: "day", value: "2026-09-09" }],
+        limit: 10
+      })
+    )
+    expect(outcome.scopeEmpty).toBe(true)
+    expect(outcome.archivedMatches).toBe(0)
+    expect(outcome.archived).toEqual([])
+  })
+
+  it("reports null supersession for an archived row nothing replaced, and bounds the list by limit", async () => {
+    await repo.commit(
+      [
+        {
+          path: "archive/2026/areas/journal/2026-09-01.html",
+          html: memoryHtml({
+            title: "Journal for 2026-09-01",
+            claim: "Started on the analyzer chain.",
+            memoryType: "episodic",
+            status: "archived",
+            archivedAt: "2026-09-03T03:00:00Z",
+            facets: [{ name: "doc-type", value: "daily-journal" }]
+          })
+        }
+      ],
+      "an evicted journal nothing superseded"
+    )
+    const outcome = await withIndexed(repo, ({ retrieval }) =>
+      retrieval.search({
+        query: "journal",
+        facets: [{ name: "doc-type", value: "daily-journal" }],
+        limit: 1
+      })
+    )
+    expect(outcome.scopeEmpty).toBe(true)
+    // Both archived journals carry the facet; the count is the whole scope, the list is bounded.
+    expect(outcome.archivedMatches).toBe(2)
+    expect(outcome.archived).toEqual([
+      { path: "archive/2026/areas/journal/2026-09-01.html", supersededBy: null }
+    ])
+  })
+
+  it("stays at the zero shape under asOf, whose lens already admits archived rows", async () => {
+    // Under `asOf` the archived flag did not empty the search; validity did. Counting archived rows
+    // would name a record that did not exist at the asked instant.
+    const outcome = await withIndexed(repo, ({ retrieval }) =>
+      retrieval.search({
+        query: "journal",
+        facets: [{ name: "day", value: "2026-09-02" }],
+        asOf: "2020-01-01T00:00:00Z",
+        limit: 10
+      })
+    )
+    expect(outcome.hits).toEqual([])
+    expect(outcome.scopeEmpty).toBe(true)
+    expect(outcome.archivedMatches).toBe(0)
+    expect(outcome.archived).toEqual([])
+  })
+
+  it("keeps a true count under limit 0, where LIMIT 0 would otherwise drop the window with the rows", async () => {
+    const outcome = await withIndexed(repo, ({ retrieval }) =>
+      retrieval.search({
+        query: "journal",
+        facets: [{ name: "day", value: "2026-09-02" }],
+        limit: 0
+      })
+    )
+    expect(outcome.scopeEmpty).toBe(true)
+    expect(outcome.archivedMatches).toBe(1)
+    expect(outcome.archived).toHaveLength(1)
+  })
+
+  it("stays at the zero shape for an unscoped empty result, which is the corpus's answer", async () => {
+    const bare = await makeFixtureRepo()
+    try {
+      const outcome = await withDb((db) =>
+        Effect.gen(function* () {
+          yield* Effect.promise(() =>
+            bare.commit([{ path: "README.md", html: "# no memories here\n" }], "seed nothing")
+          )
+          yield* indexInto(db, bare, makeFakeEmbedder())
+          const retrieval = makeRetrieval({ db, embeddings: makeFakeEmbedder() })
+          return yield* retrieval.search({ query: "journal" })
+        })
+      )
+      expect(outcome.scopeEmpty).toBe(false)
+      expect(outcome.archivedMatches).toBe(0)
+      expect(outcome.archived).toEqual([])
+    } finally {
+      await bare.cleanup()
+    }
+  })
+})
+
+/**
+ * The vector coverage gate (issue #141).
+ *
+ * A SPARSE vector plane is worse than none. When only a few chunks carry vectors, the vector arm's
+ * whole candidate list is those few files, so each of them collects a vector contribution on top of
+ * whatever else it earned, and the files that happen to be embedded outrank an exact lexical match on
+ * every query. In production the embedded few were the newest files (an incremental `index update
+ * --embed` only reaches changed files), so every search returned the newest files regardless of the
+ * query, with `degraded: false` because the arm did fire.
+ *
+ * The corpus here is built to that shape: one OLD file whose title holds a proper noun nothing else
+ * carries, ninety-seven older fillers, and two NEWEST files. Everything is embedded, then every vector
+ * but the two newest files' is deleted, which leaves coverage at 2 percent and puts the vector arm's
+ * entire list on the recency arm's top two.
+ */
+const COVERAGE_TARGET = "areas/billing/quillhaven-owns-the-ledger.html"
+const COVERAGE_NEWEST: ReadonlyArray<string> = [
+  "areas/deploy/newest-rollout-note-1.html",
+  "areas/deploy/newest-rollout-note-2.html"
+]
+const COVERAGE_FILLERS = 97
+
+const sparseCorpus = (): ReadonlyArray<SeedFile> => [
+  {
+    path: COVERAGE_TARGET,
+    html: memoryHtml({
+      title: "Quillhaven owns the billing ledger",
+      claim: "The Quillhaven team owns the billing ledger and its end-of-day reconciliation job.",
+      memoryType: "semantic",
+      tags: ["billing"],
+      createdAt: "2026-01-05T00:00:00Z",
+      updatedAt: "2026-01-05T00:00:00Z"
+    })
+  },
+  ...Array.from({ length: COVERAGE_FILLERS }, (_, offset): SeedFile => {
+    const index = offset + 1
+    const day = new Date(Date.UTC(2026, 1, 1 + offset)).toISOString().slice(0, 10)
+    return {
+      path: `resources/misc/coverage-filler-${String(index).padStart(3, "0")}.html`,
+      html: memoryHtml({
+        title: `Coverage filler ${index}`,
+        claim: `An unrelated observation about okapi and wildebeest number ${index}.`,
+        memoryType: "episodic",
+        tags: ["filler"],
+        createdAt: `${day}T00:00:00Z`,
+        updatedAt: `${day}T00:00:00Z`
+      })
+    }
+  }),
+  ...COVERAGE_NEWEST.map((path, offset): SeedFile => {
+    const day = `2026-08-0${offset + 1}`
+    return {
+      path,
+      html: memoryHtml({
+        title: `Newest rollout note ${offset + 1}`,
+        claim: `The rollout window on the newest cluster opened on ${day} without incident.`,
+        memoryType: "episodic",
+        tags: ["deploy"],
+        createdAt: `${day}T00:00:00Z`,
+        updatedAt: `${day}T00:00:00Z`
+      })
+    }
+  })
+]
+
+/** Delete every vector except the ones on the two newest files. */
+const keepOnlyNewestVectors = (db: DatabaseShape) =>
+  db.run(
+    `DELETE FROM embeddings WHERE chunk_id NOT IN (SELECT chunk_id FROM chunks WHERE path IN (?, ?))`,
+    [...COVERAGE_NEWEST]
+  )
+
+/** The fixture's real coverage, read directly so the test proves its own premise. */
+const rawCoverage = (db: DatabaseShape) =>
+  db
+    .get<{ chunks: number; embedded: number }>(
+      "SELECT (SELECT count(*) FROM chunks) AS chunks, (SELECT count(*) FROM embeddings) AS embedded"
+    )
+    .pipe(Effect.map((row) => (row?.embedded ?? 0) / (row?.chunks ?? 1)))
+
+describe("the vector coverage gate", () => {
+  let repo: FixtureRepo
+
+  beforeEach(async () => {
+    repo = await makeFixtureRepo()
+    await repo.commit(sparseCorpus(), "seed a corpus the vector plane will only partly cover")
+  })
+
+  afterEach(() => repo.cleanup())
+
+  it("ranks the exact-title match first and reports degraded when 2 percent of chunks carry vectors, all on the newest files", async () => {
+    const outcome = await withDb((db) =>
+      Effect.gen(function* () {
+        yield* indexInto(db, repo, makeFakeEmbedder())
+        yield* keepOnlyNewestVectors(db)
+        const coverage = yield* rawCoverage(db)
+        const query = makeFakeEmbedder()
+        const result = yield* makeRetrieval({ db, embeddings: query }).search({
+          query: "Quillhaven",
+          limit: 5
+        })
+        return { coverage, result, queryCalls: query.calls() }
+      })
+    )
+    // The premise: the plane really is sparse, and sparse in the recency arm's favour.
+    expect(outcome.coverage).toBeGreaterThan(0)
+    expect(outcome.coverage).toBeLessThan(0.05)
+
+    // THE PROPERTY. The one file whose title holds the noun wins, and the result says it was ranked
+    // by fewer signals.
+    expect(outcome.result.hits[0]?.path).toBe(COVERAGE_TARGET)
+    expect(outcome.result.degraded).toBe(true)
+    expect(outcome.result.arms).not.toContain("vector")
+    // The coverage travels with the result, so a caller can tell this degradation from an embedder
+    // outage, and the query was never embedded: a Bedrock call for an arm that will not fire is waste.
+    expect(outcome.result.vectorCoverage).toBeCloseTo(0.02, 2)
+    expect(outcome.queryCalls).toBe(0)
+  })
+
+  it("fires the vector arm at full coverage, and the same query still ranks the same file first", async () => {
+    const result = await withDb((db) =>
+      Effect.gen(function* () {
+        yield* indexInto(db, repo, makeFakeEmbedder())
+        expect(yield* rawCoverage(db)).toBe(1)
+        return yield* makeRetrieval({ db, embeddings: makeFakeEmbedder() }).search({
+          query: "Quillhaven",
+          limit: 5
+        })
+      })
+    )
+    expect(result.degraded).toBe(false)
+    expect(result.arms).toContain("vector")
+    expect(result.vectorCoverage).toBe(1)
+    expect(result.hits[0]?.path).toBe(COVERAGE_TARGET)
+  })
+
+  it("honors an injected floor: below the fixture's coverage the arm fires, and the inversion is visible", async () => {
+    /**
+     * The floor is a dependency so a test can move it. With the floor UNDER the fixture's coverage the
+     * gate stays open, and this is the defect in the raw: the two embedded files outrank the exact
+     * title match because each collects a vector rank on top of its recency rank. Pinned here so the
+     * mechanism the gate exists for is a fact the suite states rather than a story in a comment.
+     */
+    const result = await withDb((db) =>
+      Effect.gen(function* () {
+        yield* indexInto(db, repo, makeFakeEmbedder())
+        yield* keepOnlyNewestVectors(db)
+        return yield* makeRetrieval({
+          db,
+          embeddings: makeFakeEmbedder(),
+          vectorCoverageFloor: 0.01
+        }).search({ query: "Quillhaven", limit: 5 })
+      })
+    )
+    expect(result.degraded).toBe(false)
+    expect(result.arms).toContain("vector")
+    expect(result.vectorCoverage).toBeCloseTo(0.02, 2)
+    expect(COVERAGE_NEWEST).toContain(result.hits[0]?.path)
+  })
+
+  it("recall reports the same coverage and the same degradation as search", async () => {
+    const pack = await withDb((db) =>
+      Effect.gen(function* () {
+        yield* indexInto(db, repo, makeFakeEmbedder())
+        yield* keepOnlyNewestVectors(db)
+        const query = makeFakeEmbedder()
+        const pack = yield* makeRetrieval({ db, embeddings: query }).recall({
+          query: "Quillhaven"
+        })
+        return { pack, queryCalls: query.calls() }
+      })
+    )
+    expect(pack.pack.degraded).toBe(true)
+    expect(pack.pack.vectorCoverage).toBeCloseTo(0.02, 2)
+    expect(pack.queryCalls).toBe(0)
+    expect(pack.pack.memories.disclosed[0]?.path).toBe(COVERAGE_TARGET)
   })
 })

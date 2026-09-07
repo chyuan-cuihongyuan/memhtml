@@ -3,7 +3,8 @@
 # `memhtml` — agent instructions
 
 `memhtml` is the CLI over a git-backed memory repo. Every command writes exactly ONE JSON envelope
-to stdout and nothing else; logs go to stderr.
+to stdout and nothing else, with one exception: `memhtml help` on a terminal writes Markdown, and
+piped or with `--json` it is an envelope like every other command. Logs go to stderr.
 
 ## The envelope
 
@@ -33,7 +34,7 @@ no database, and no credentials, so it is also the liveness check.
 
 ### `first-call`
 
-You are reading this CLI's manifest: every command, argument, flag, response type, error code, and environment variable the binary accepts. A bare `memhtml`, `memhtml help`, `memhtml --help`, and `memhtml manifest` all return it, and all four answer on a machine with no repo, no database, and no credentials, so this is also the liveness check when something else has failed. Every command writes exactly ONE JSON envelope to stdout and nothing else; logs go to stderr. A success is `{apiVersion, type, data}` and a failure is `{apiVersion, error, code, suggestions}`. Branch on `code`, never on the `error` prose: the codes and response types are append-only and a shipped one never changes meaning, while the prose changes freely as wording improves. Exit 0 is success, exit 2 is a usage error you fix by changing the call, exit 1 is a runtime failure you fix by changing the repo or the environment. Add `--dense` to any command to get minified JSON with null fields dropped, which is what you want when the output goes into a prompt.
+You are reading this CLI's manifest: every command, argument, flag, response type, error code, and environment variable the binary accepts. A bare `memhtml` and `memhtml manifest` return it, and so do `memhtml help` and `memhtml --help` when stdout is a pipe; all of them answer on a machine with no repo, no database, and no credentials, so this is also the liveness check when something else has failed. For one command, `memhtml help <command>` or `memhtml <command> --help` returns that command's entry as a `cli.help` envelope with a usage line and examples (Markdown instead when stdout is a terminal; add `--json` to force the envelope). Every command writes exactly ONE JSON envelope to stdout and nothing else, with one exception: help on a terminal writes Markdown, and piped or with `--json` it is an envelope like every other command. Logs go to stderr. A success is `{apiVersion, type, data}` and a failure is `{apiVersion, error, code, suggestions}`. Branch on `code`, never on the `error` prose: the codes and response types are append-only and a shipped one never changes meaning, while the prose changes freely as wording improves. Exit 0 is success, exit 2 is a usage error you fix by changing the call, exit 1 is a runtime failure you fix by changing the repo or the environment. Add `--dense` to any command to get minified JSON with null fields dropped, which is what you want when the output goes into a prompt.
 
 ### `write-surfaces`
 
@@ -73,6 +74,7 @@ Answering a question that takes MORE THAN ONE HOP through the corpus? Write it a
 |---|---|---|---|
 | `--dense` | boolean | false | Minify JSON and drop null fields, for pasting into a context window. |
 | `--repo` | string | — | Path to the memory repo. Defaults to $MEMHTML_ROOT. |
+| `--help` | boolean | false | Describe this command instead of running it: usage, arguments, flags, response type, examples. Also `-h`. Markdown when stdout is a terminal, a `cli.help` envelope when piped or with --json. Flags other than --json and --dense are ignored, nothing is opened or written, exit 0. |
 
 ## Commands
 
@@ -81,6 +83,7 @@ Answering a question that takes MORE THAN ONE HOP through the corpus? Write it a
 | Command | Arguments | Flags | Response type |
 |---|---|---|---|
 | `memhtml manifest` | — | — | `cli.manifest` |
+| `memhtml help` | [command] | `--json` | `cli.help`, `cli.manifest` |
 | `memhtml init` | — | — | `repo.init` |
 | `memhtml write` | — | `--title`* `--claim` `--body` `--article-html` `--type`* `--path` `--strict-path` `--workspace` `--tag` `--entity` `--importance` `--confidence` `--session-id` `--prompt-id` `--turn-uuid` | `memory.written` |
 | `memhtml apply` | — | `--file` `--continue-on-error` `--detect-conflicts` `--detect-near-duplicates` `--consolidate` `--session-id` `--prompt-id` `--turn-uuid` | `batch.applied` |
@@ -98,8 +101,9 @@ Answering a question that takes MORE THAN ONE HOP through the corpus? Write it a
 | `memhtml task add` | — | `--title`* `--claim` `--body` `--status` `--due` `--workspace` `--tag` `--entity` `--session-id` `--prompt-id` `--turn-uuid` | `task.written` |
 | `memhtml task status` | <path> <status> | `--reason` | `task.updated` |
 | `memhtml task list` | — | `--status` `--workspace` `--due-before` `--limit` `--cursor` `--include-archived` `--detected` | `task.list` |
-| `memhtml index rebuild` | — | `--embed` | `index.report` |
+| `memhtml index rebuild` | — | `--embed` `--force` | `index.report` |
 | `memhtml index update` | — | `--embed` | `index.report` |
+| `memhtml index embed` | — | `--dry-run` | `index.report` |
 | `memhtml index status` | — | — | `index.report` |
 | `memhtml trace index` | — | — | `trace.report` |
 | `memhtml trace search` | <query> | `--cwd` `--since` `--limit` | `trace.sessions` |
@@ -123,6 +127,14 @@ Answering a question that takes MORE THAN ONE HOP through the corpus? Write it a
 ### `memhtml manifest`
 
 Emit this CLI's full machine-readable contract.
+
+### `memhtml help`
+
+Describe one command: usage, arguments, flags, response type, examples. Markdown on a terminal, a cli.help envelope when piped.
+
+- `[command]` — The command to describe, one or two words (`search`, `index rebuild`). Omitted: the whole manifest, as Markdown on a terminal and as the cli.manifest envelope when piped.
+
+- `--json` (boolean) — Emit the cli.help envelope even when stdout is a terminal. Wins over the terminal check, so a script can never receive Markdown by accident. _(default `false`)_
 
 ### `memhtml init`
 
@@ -175,7 +187,7 @@ Read one memory: its metas, links, article, and format warnings.
 
 Ranked search: four RRF arms plus MMR. Degrades to the lexical floor.
 
-- `<query>` — Prose. Never a query language.
+- `<query>` — Prose. A double-quoted span demands those words in that order; nothing else is syntax.
 
 - `--type` (string) — Restrict to one memory type. Repeatable; each occurrence broadens (ANY-of). _(repeatable; one of: `episodic`, `semantic`, `procedural`, `agent_insight`, `user_preference`, `error_pattern`, `verdict`, `precedent`, `task`)_
 - `--workspace` (string) — Restrict to one workspace. STRICT: a scoped query never returns a memory with no workspace.
@@ -190,7 +202,7 @@ Ranked search: four RRF arms plus MMR. Degrades to the lexical floor.
 
 A disclosure pack under a character budget: arcs and memories folded separately.
 
-- `<query>` — Prose.
+- `<query>` — Prose. A double-quoted span demands those words in that order; nothing else is syntax.
 
 - `--type` (string) — Restrict to one memory type. Repeatable; each occurrence broadens (ANY-of). _(repeatable; one of: `episodic`, `semantic`, `procedural`, `agent_insight`, `user_preference`, `error_pattern`, `verdict`, `precedent`, `task`)_
 - `--workspace` (string) — Restrict to one workspace. STRICT: a scoped query never returns a memory with no workspace.
@@ -318,15 +330,22 @@ The task working set: a direct indexed scan with blockers, never ranked retrieva
 
 ### `memhtml index rebuild`
 
-Rebuild index.db from the git tree at HEAD. Destroys nothing outside .memhtml/.
+Rebuild index.db from the git tree at HEAD, keeping every stored vector whose chunk survives. Destroys nothing outside .memhtml/.
 
-- `--embed` (boolean) — Fill missing vectors from Bedrock. --no-embed makes the rebuild instant. _(default `true`)_
+- `--embed` (boolean) — Fill missing vectors from Bedrock. --no-embed makes the rebuild instant and leaves new or changed chunks without a vector; the vectors already stored survive either way when the model is unchanged. With MEMHTML_EMBED=off, --embed is held to the same rules as --no-embed. _(default `true`)_
+- `--force` (boolean) — Run a rebuild that cannot write vectors (--no-embed, or --embed with MEMHTML_EMBED=off) over a store that already carries them. Without it that call is refused with ERR_REBUILD_NO_EMBED_REFUSED, because a store with vectors was embedded on purpose. Accepted and inert when the rebuild can embed. _(default `false`)_
 
 ### `memhtml index update`
 
 Index only what moved since the recorded watermark, plus the dirty working tree.
 
 - `--embed` (boolean) — Fill missing vectors. _(default `true`)_
+
+### `memhtml index embed`
+
+Fill every chunk that has no vector in the configured space, without a rebuild. Safe to rerun; reports the gap it left.
+
+- `--dry-run` (boolean) — Report the gap (embeddingsRemaining) and write nothing. _(default `false`)_
 
 ### `memhtml index status`
 
@@ -340,7 +359,7 @@ Scan $MEMHTML_TRACE_ROOT for Claude Code transcripts, reading only what changed.
 
 FTS over session first-prompts and AI titles. Never enters memory retrieval.
 
-- `<query>` — Prose.
+- `<query>` — Prose. A double-quoted span demands those words in that order; nothing else is syntax.
 
 - `--cwd` (string) — Restrict to sessions from this directory.
 - `--since` (string) — ISO-8601 lower bound on started_at.
@@ -380,7 +399,7 @@ Per-phase counts, the commit list, diff --stat, and a per-file classification.
 
 ### `memhtml sleep merge`
 
-Fast-forward main to the run's branch, after the discrimination gate passes.
+Fast-forward main to the run's branch after the discrimination gate passes, then project the merged commit into the index.
 
 - `<run-id>` — The run id.
 
@@ -453,6 +472,7 @@ Run the `memhtml-mcp` stdio server: 18 tools and 3 resources over this same repo
 - `ERR_MISSING_ARGUMENT`
 - `ERR_INVALID_FLAG`
 - `ERR_UNEXPECTED_ARGUMENT`
+- `ERR_REPO_REQUIRED`
 - `ERR_PATH_NOT_FOUND`
 - `ERR_INVALID_MEMORY`
 - `ERR_DUPLICATE_CONTENT`
@@ -465,12 +485,14 @@ Run the `memhtml-mcp` stdio server: 18 tools and 3 resources over this same repo
 - `ERR_GIT`
 - `ERR_DISCRIMINATION_FAILED`
 - `ERR_UNKNOWN`
+- `ERR_REBUILD_NO_EMBED_REFUSED`
 
 ## Configuration
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `MEMHTML_ROOT` | `~/memhtml` | The memory repo's root: a git repository holding the corpus and `.memhtml/`. |
+| `MEMHTML_REFUSE_ENV_ROOT` | — | Set to any value but `0`, `false`, `no`, or `off` (absent or blank is off; case-insensitive) makes `memhtml` take its repo from `--repo` alone: `MEMHTML_ROOT` and the `~/memhtml` default stop being doors, and a call that opens a repo without `--repo` is refused with ERR_REPO_REQUIRED at exit 2 before `memhtml` opens anything. For CI, for a test suite calling the CLI in-process, and for an agent runtime that exports `MEMHTML_ROOT` to every subprocess it starts. Commands that never open a repo (`manifest`, `help`, `agents-doc`, `eval discriminate`) are unaffected. It governs the roots `memhtml` resolves from its own environment: a caller that hands the in-process `run()` a layer it built states that layer's root itself. Read by `memhtml` only: `memhtml-mcp` takes its root from `MEMHTML_ROOT`, which `memhtml serve mcp --repo` sets for the child explicitly. |
 | `MEMHTML_TRACE_ROOT` | `~/.claude` | Where `memhtml trace index` reads Claude Code transcripts from. Read-only; never written. |
 | `MEMHTML_AWS_REGION` | `us-east-1` | The Bedrock region for embeddings and the sleep cycle's model-calling phases. |
 | `AWS_BEARER_TOKEN_BEDROCK` | — | Bedrock bearer token, read by the AWS SDK itself. Absent means the default credential chain; retrieval then degrades to the lexical floor rather than failing. |
@@ -479,6 +501,7 @@ Run the `memhtml-mcp` stdio server: 18 tools and 3 resources over this same repo
 | `MEMHTML_LLM_MODEL_PREFIX` | `bedrock/` | The prefix in front of every Bedrock model id a proxied request carries, so `global.anthropic.claude-opus-5` is asked for as `bedrock/global.anthropic.claude-opus-5`: the LiteLLM convention, which a LiteLLM proxy routes with one `bedrock/*` entry and which keeps the id after the slash exactly what Bedrock wants. Set it to `none` for a proxy that takes bare Bedrock ids. Read only when `MEMHTML_LLM_BASE_URL` is set. |
 | `MEMHTML_LLM_MODEL_MAP` | — | `from=to` pairs, comma-separated, naming single models to the proxy by exact id when the prefix rule does not fit: `cohere.embed-v4:0=cohere-embed-v4`. A mapped id is sent verbatim, without the prefix; every other id follows `MEMHTML_LLM_MODEL_PREFIX`. Read only when `MEMHTML_LLM_BASE_URL` is set. |
 | `MEMHTML_EMBED` | `on` | `off` disables the embedder entirely. An explicit opt-out, distinct from a missing credential: a missing credential degrades one search at call time, `off` degrades every search, and an operator reading this manifest needs those to be different states. |
+| `MEMHTML_VECTOR_COVERAGE_FLOOR` | `0.95` | The share of indexed chunks that must carry a vector in the configured space, `0` to `1`, before the vector arm is trusted. Below it `search` and `recall` drop the vector arm and report `degraded: true` with `vectorCoverage`, `doctor` reports `vectorCoverageLow` and `healthy: false`, and a sleep run warns. A sparse plane ranks the few embedded files above every exact match, so it is treated as absent rather than run. Sleep also refuses below a fixed hard floor of `0.5`, which this variable does not move: a value under `0.5` keeps search and doctor accepting a plane sleep still refuses. Remedy: `memhtml index embed`, or `memhtml index rebuild --embed`. |
 | `MEMHTML_LLM` | `on` | `off` makes every model-calling sleep phase report `no model bound` and stay `ok`, so a credential-free run is honest rather than red. `entity-resolution` still runs its deterministic normalization and character-overlap passes; the others do nothing. |
 | `MEMHTML_EXTRACT_ENTITIES` | `on` | `off` removes the one `global.openai.gpt-5.6-terra` call per write batch that extracts `memhtml-entity` metas the ops did not declare; `MEMHTML_LLM=off` removes it too. On by default, like MEMHTML_EMBED. It changes what a write STORES: extracted entities land in the files as if authored, and the write itself never waits on or fails with the model. A failed extraction is a logged warning and an unextracted batch. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | — | An OTLP collector's base URL, e.g. `http://localhost:4318`. Set, the ~30 `Effect.withSpan` annotations already in the code (retrieval, embeddings, model calls, indexing, the sleep cycle, store writes, `db.*`, `git.*`) export as traces to `<endpoint>/v1/traces`, batched, flushed on exit. Unset, nothing is loaded and behavior is byte-identical. Export can never fail a command: a down collector is one stderr warning and a command that proceeds untraced. |

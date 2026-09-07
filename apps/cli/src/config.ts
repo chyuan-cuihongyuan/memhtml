@@ -1,6 +1,6 @@
 import { homedir } from "node:os"
 import { join } from "node:path"
-
+import { VECTOR_COVERAGE_FLOOR } from "@memhtml/index"
 import {
   DEFAULT_PROXY_MODEL_PREFIX,
   PROXY_API_KEY_VAR,
@@ -31,6 +31,32 @@ export interface ConfigVar {
   readonly fallback: string | null
 }
 
+/**
+ * `MEMHTML_REFUSE_ENV_ROOT`: the environment is not a door to a repo.
+ *
+ * Declared as a constant so the manifest row below and the read in {@link refusesEnvRoot} cannot
+ * name two different strings.
+ */
+export const REFUSE_ENV_ROOT_VAR = "MEMHTML_REFUSE_ENV_ROOT"
+
+/** The spellings that leave the refusal OFF. Absent and blank are off; any other value is on. */
+const REFUSE_ENV_ROOT_OFF: ReadonlySet<string> = new Set(["", "0", "false", "no", "off"])
+
+/**
+ * Whether `run()` may resolve the repo from `MEMHTML_ROOT` or the `~/memhtml` default.
+ *
+ * Fails closed. The variable is a safety switch, so a spelling it does not know (`y`, `enabled`)
+ * turns it ON rather than silently off, the way `bool()` in `run.ts` reads a flag value and the
+ * inverse of how `MEMHTML_EMBED` reads its one opt-out `off`. Only the five spellings above, and
+ * absence, leave the environment as a door.
+ *
+ * Read from `process.env` directly rather than through `effect/Config`, like `MEMHTML_MCP_BIN`: the
+ * answer is needed synchronously before any Effect runs, because the refusal it drives is a usage
+ * error decided before a layer is built (`run.ts`). `env` is a parameter so a test can hand in a map.
+ */
+export const refusesEnvRoot = (env: NodeJS.ProcessEnv = process.env): boolean =>
+  !REFUSE_ENV_ROOT_OFF.has((env[REFUSE_ENV_ROOT_VAR] ?? "").trim().toLowerCase())
+
 export const CONFIG_VARS: ReadonlyArray<ConfigVar> = [
   {
     name: "MEMHTML_ROOT",
@@ -42,6 +68,16 @@ export const CONFIG_VARS: ReadonlyArray<ConfigVar> = [
      * time by `expandRoot`, which owns the platform spelling of a real path.
      */
     fallback: "~/memhtml"
+  },
+  {
+    /**
+     * Imported rather than retyped, for the reason `MCP_BIN_VAR` is: this row and the `process.env`
+     * read in {@link refusesEnvRoot} must name one string.
+     */
+    name: REFUSE_ENV_ROOT_VAR,
+    description:
+      "Set to any value but `0`, `false`, `no`, or `off` (absent or blank is off; case-insensitive) makes `memhtml` take its repo from `--repo` alone: `MEMHTML_ROOT` and the `~/memhtml` default stop being doors, and a call that opens a repo without `--repo` is refused with ERR_REPO_REQUIRED at exit 2 before `memhtml` opens anything. For CI, for a test suite calling the CLI in-process, and for an agent runtime that exports `MEMHTML_ROOT` to every subprocess it starts. Commands that never open a repo (`manifest`, `help`, `agents-doc`, `eval discriminate`) are unaffected. It governs the roots `memhtml` resolves from its own environment: a caller that hands the in-process `run()` a layer it built states that layer's root itself. Read by `memhtml` only: `memhtml-mcp` takes its root from `MEMHTML_ROOT`, which `memhtml serve mcp --repo` sets for the child explicitly.",
+    fallback: null
   },
   {
     name: "MEMHTML_TRACE_ROOT",
@@ -93,6 +129,12 @@ export const CONFIG_VARS: ReadonlyArray<ConfigVar> = [
     description:
       "`off` disables the embedder entirely. An explicit opt-out, distinct from a missing credential: a missing credential degrades one search at call time, `off` degrades every search, and an operator reading this manifest needs those to be different states.",
     fallback: "on"
+  },
+  {
+    name: "MEMHTML_VECTOR_COVERAGE_FLOOR",
+    description:
+      "The share of indexed chunks that must carry a vector in the configured space, `0` to `1`, before the vector arm is trusted. Below it `search` and `recall` drop the vector arm and report `degraded: true` with `vectorCoverage`, `doctor` reports `vectorCoverageLow` and `healthy: false`, and a sleep run warns. A sparse plane ranks the few embedded files above every exact match, so it is treated as absent rather than run. Sleep also refuses below a fixed hard floor of `0.5`, which this variable does not move: a value under `0.5` keeps search and doctor accepting a plane sleep still refuses. Remedy: `memhtml index embed`, or `memhtml index rebuild --embed`.",
+    fallback: "0.95"
   },
   {
     name: "MEMHTML_LLM",
@@ -157,4 +199,17 @@ export const MemhtmlRoot = Config.string("MEMHTML_ROOT").pipe(
 export const TraceRoot = Config.string("MEMHTML_TRACE_ROOT").pipe(
   Config.withDefault(join(homedir(), ".claude")),
   Config.map(expandRoot)
+)
+
+/**
+ * `MEMHTML_VECTOR_COVERAGE_FLOOR`: the coverage below which the vector arm is treated as absent.
+ *
+ * Read as a NUMBER here, so a value that does not parse fails at startup naming the variable rather
+ * than becoming a floor of `NaN` that no comparison ever crosses (`NaN < floor` is false, which would
+ * silently switch the gate OFF). The range check, `(0, 1]`, lives in the composition root beside the
+ * other set-but-unusable refusals (`layerRetrievalPolicy` in `api-layer.ts`). The hard floor sleep
+ * refuses below is `VECTOR_COVERAGE_HARD_FLOOR` and is not configurable.
+ */
+export const VectorCoverageFloor = Config.number("MEMHTML_VECTOR_COVERAGE_FLOOR").pipe(
+  Config.withDefault(VECTOR_COVERAGE_FLOOR)
 )

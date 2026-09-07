@@ -419,18 +419,37 @@ Flags:
 ## index rebuild
 
 ```
-memhtml index rebuild [--no-embed]
+memhtml index rebuild [--no-embed] [--force]
 ```
 
-Rebuild `index.db` from the git tree at HEAD. Destroys nothing outside `.memhtml/`. `apps/cli/src/run.ts:528-534`
+Rebuild `index.db` from the git tree at HEAD, keeping every stored vector whose chunk survives. Destroys nothing outside `.memhtml/`. `apps/cli/src/run.ts`
 
 Flags:
 
-- `--embed`: Fill missing vectors from Bedrock. `--no-embed` makes the rebuild instant. Boolean, default true. `apps/cli/src/commands.ts:567`
+- `--embed`: Fill missing vectors from Bedrock. `--no-embed` makes the rebuild instant and leaves new or changed chunks without a vector; the vectors already stored survive either way. Boolean, default true. `apps/cli/src/commands.ts`
+- `--force`: Run `--no-embed` over a store that already carries vectors. Without it that call is refused with `ERR_REBUILD_NO_EMBED_REFUSED`. Boolean, default false. `apps/cli/src/commands.ts`
+
+A rebuild keeps its vectors. `truncateForRebuild` stashes the `embeddings` rows in the configured vector space into a temp table before it empties the memory tables, and after the projections land it re-inserts every row whose chunk id exists again. Chunk ids are `sha256(content_hash:ordinal)`, so a chunk that came back with the same id has the same text and the stored vector is still the right one. The report's `embeddingsPreserved` is that count. Only a model change empties the vector plane, because the stash keeps rows in the configured space and on a model change there are none. `packages/index/src/indexer.ts`
+
+`--no-embed` over a store that carries vectors is refused unless `--force` is given: exit 1, `ERR_REBUILD_NO_EMBED_REFUSED`, the count in `error` and in a WARN on stderr, nothing written. `--no-embed` is the harness flag, and it was run against a live store by accident; a store with vectors is a store somebody embedded on purpose. `packages/index/src/indexer.ts`, `apps/cli/src/errors.ts`
 
 `memhtml index rebuild --embed` is the embed-model migration path: it is the one call that rewrites the vector space, and `EmbedModelMismatch` names it as its own recovery. There is no flag naming a model, because the model comes from the environment and a rebuild fills every missing vector in whatever space is configured. `apps/cli/src/errors.ts:157`
 
-It is also the recovery from `ERR_INDEX_STALE`, and the only one. A rebuild that emptied the tables and did not finish repopulating them is detectable, and `memhtml index update` is what raises the tag — it refuses a watermark row with no commit on it rather than diffing from nothing — so a rebuild is the one call that repopulates what the interrupted pass left partial. `packages/index/src/indexer.ts:125`, `packages/index/src/indexer.ts:605-609`, `apps/cli/src/errors.ts:158`
+It is also the recovery from `ERR_INDEX_STALE`, and the only one. A rebuild that emptied the tables and did not finish repopulating them is detectable, and `memhtml index update` is what raises the tag — it refuses a watermark row with no commit on it rather than diffing from nothing — so a rebuild is the one call that repopulates what the interrupted pass left partial. `IndexStale` and `update` in `packages/index/src/indexer.ts`, `apps/cli/src/errors.ts`
+
+## index embed
+
+```
+memhtml index embed [--dry-run]
+```
+
+Fill every chunk that has no vector in the configured space, without a rebuild. Runs the bare unscoped `embedMissing()` in persisted slices, writes vectors and nothing else, and is safe to rerun. `apps/cli/src/run.ts`, `packages/index/src/indexer.ts`
+
+Flags:
+
+- `--dry-run`: Report the gap and write nothing. Boolean, default false. `apps/cli/src/commands.ts`
+
+The response is an `index.report` with `mode: "embed"`, `headSha` (the recorded watermark), `chunks`, `embeddings`, `embeddingsWritten`, and `embeddingsRemaining`, the chunks still without a vector after the pass. With no embedder configured (`MEMHTML_EMBED=off`) it writes 0 and reports the remaining gap. This is the recovery from a sparse vector plane: `index update --embed` embeds only its own batch's chunks and never revisits a chunk that lost its vector, which is how a live store came to hold 183 embeddings under 9,332 chunks.
 
 ## index update
 
@@ -573,7 +592,7 @@ This command exits 0 even when the run it describes failed. It reports a run it 
 memhtml sleep merge <run-id> [--skip-gate]
 ```
 
-Fast-forward main to the run's branch, after the discrimination gate passes. `apps/cli/src/run.ts:614-645`
+Fast-forward main to the run's branch after the discrimination gate passes, then project the merged commit into the index. `apps/cli/src/run.ts:614-645`
 
 Arguments:
 
@@ -588,6 +607,8 @@ The gate is composed here rather than defaulted inside the sleep package. A fail
 The merge is also where a run's deferred state-plane writes land. `git branch -D` is this design's abort and `main` never moves during a run, so a write into `.memhtml/state.db` performed DURING a phase would outlive the branch that earned it — and for the consolidation watermark that is data loss rather than bookkeeping, because the watermark is an anti-join and a session it covers is never selected again. So `trace-consolidation`, `edge-typing`, and `entity-resolution` record their writes as marks in a committed ledger, `.memhtml/sleep/<run-id>.pending.jsonl`, and this command reads that ledger as a blob at the branch tip and applies the marks after the fast-forward succeeds. `packages/sleep/src/contract.ts:306-352`, `packages/sleep/src/review.ts:344-366`
 
 The report carries `marksPending` and `marksApplied`, two numbers rather than one because they answer different questions: what the branch earned, and what the plane took. They agree on an ordinary merge, so a disagreement is the operator-visible reading of a plane write that did not land — the sessions in the shortfall stay unconsolidated and are re-read next cycle, which costs a model call and loses nothing. A failed apply does not fail the merge: `main` has already moved and the memories are landed. `packages/sleep/src/contract.ts:272-286`
+
+Once `main` has moved, the merge projects the merged commit into the index with the same incremental update `memhtml index update --embed` runs, so the run's memories are searchable when the command returns. The report carries `indexUpdated`, `indexHeadSha`, `indexAdded`, `indexModified`, `indexRemoved`, `indexRenamed`, and `embeddingsWritten`. A failed update does not fail the merge either, for the same reason a failed mark apply does not: the report says `indexUpdated: false` with `indexError`, and a WARN on stderr names the recovery. `reindex` in `packages/sleep/src/review.ts`
 
 ## sleep status
 
@@ -763,7 +784,11 @@ The override variable's name is declared once as a constant, and the config tabl
 
 A caller should branch on `code` rather than on the `error` prose. The code list is append-only. A shipped code keeps its meaning and is not removed. `apps/cli/src/envelope.ts:62-87`
 
-The sixteen codes, in `ERROR_CODES` order, are `ERR_UNKNOWN_COMMAND`, `ERR_MISSING_ARGUMENT`, `ERR_INVALID_FLAG`, `ERR_UNEXPECTED_ARGUMENT`, `ERR_PATH_NOT_FOUND`, `ERR_INVALID_MEMORY`, `ERR_DUPLICATE_CONTENT`, `ERR_WRITE_CONFLICT`, `ERR_DIRTY_TREE`, `ERR_INDEX_STALE`, `ERR_EMBED_MODEL_MISMATCH`, `ERR_MODEL_UNAVAILABLE`, `ERR_STORAGE`, `ERR_GIT`, `ERR_DISCRIMINATION_FAILED`, `ERR_UNKNOWN`. `apps/cli/src/envelope.ts:67-87`
+The eighteen codes, in `ERROR_CODES` order, are `ERR_UNKNOWN_COMMAND`, `ERR_MISSING_ARGUMENT`, `ERR_INVALID_FLAG`, `ERR_UNEXPECTED_ARGUMENT`, `ERR_REPO_REQUIRED`, `ERR_PATH_NOT_FOUND`, `ERR_INVALID_MEMORY`, `ERR_DUPLICATE_CONTENT`, `ERR_WRITE_CONFLICT`, `ERR_DIRTY_TREE`, `ERR_INDEX_STALE`, `ERR_EMBED_MODEL_MISMATCH`, `ERR_MODEL_UNAVAILABLE`, `ERR_STORAGE`, `ERR_GIT`, `ERR_DISCRIMINATION_FAILED`, `ERR_UNKNOWN`, `ERR_REBUILD_NO_EMBED_REFUSED`. `apps/cli/src/envelope.ts:67-87`
+
+`ERR_REPO_REQUIRED` is the exit-2 refusal `MEMHTML_REFUSE_ENV_ROOT` produces for a call that opens a repo and names none with `--repo`. It is a usage code because the fix is on the line, and its suggestion is the flag spelling. `apps/cli/src/run.ts`
+
+`ERR_REBUILD_NO_EMBED_REFUSED` is `index rebuild --no-embed` over a store that carries vectors in the configured space, without `--force`. Its suggestions are `memhtml index rebuild --embed`, `memhtml index rebuild --no-embed --force`, and `memhtml index embed`. `apps/cli/src/errors.ts`
 
 `ERR_UNEXPECTED_ARGUMENT` names a positional past what the command declares. It is its own code rather than a reuse of a neighbor, because the offending token is not a flag, which rules out `ERR_INVALID_FLAG`, and it is surplus rather than absent, which rules out `ERR_MISSING_ARGUMENT`: the caller fixes it by dropping a word instead of adding one. `apps/cli/src/envelope.ts:71-74`
 
@@ -778,10 +803,12 @@ For a two-word command the distance is measured against the whole typed invocati
 Every environment variable is declared in one array, which is what `memhtml manifest` reads to describe them. `apps/cli/src/config.ts:26-78`
 
 - `MEMHTML_ROOT`: The memory repo's root: a git repository holding the corpus and `.memhtml/`. Defaults to `~/memhtml`. `apps/cli/src/config.ts:28-31`
+- `MEMHTML_REFUSE_ENV_ROOT`: Set to any value but `0`, `false`, `no`, or `off` (absent or blank is off; case-insensitive) makes `memhtml` take its repo from `--repo` alone, so `MEMHTML_ROOT` and the `~/memhtml` default stop being doors and a call that opens a repo without `--repo` is refused with `ERR_REPO_REQUIRED` at exit 2 before anything is opened. Meant for CI, for a suite calling the CLI in-process, and for an agent runtime that exports `MEMHTML_ROOT` to every subprocess. Read by `memhtml` only; `memhtml-mcp` takes its root from `MEMHTML_ROOT`, which `memhtml serve mcp --repo` sets for the child. `apps/cli/src/config.ts`
 - `MEMHTML_TRACE_ROOT`: Where `memhtml trace index` reads Claude Code transcripts from. Read-only. Defaults to `~/.claude`. `apps/cli/src/config.ts:33-36`
 - `MEMHTML_AWS_REGION`: The Bedrock region for embeddings and the sleep cycle's model-calling phases. Defaults to `us-east-1`. `apps/cli/src/config.ts:39-41`
 - `AWS_BEARER_TOKEN_BEDROCK`: Bedrock bearer token, read by the AWS SDK itself. When it is absent the SDK falls back to the default credential chain, and retrieval degrades to the lexical floor instead of failing. `apps/cli/src/config.ts:44-47`
 - `MEMHTML_EMBED`: `off` disables the embedder entirely. An explicit opt-out, distinct from a missing credential: a missing credential degrades one search at call time and `off` degrades every search. Defaults to `on`. `apps/cli/src/config.ts:50-53`
+- `MEMHTML_VECTOR_COVERAGE_FLOOR`: The share of indexed chunks that must carry a vector in the configured space before the vector arm is trusted, `0` to `1`. Below it `search` and `recall` drop the vector arm and report `degraded: true` with `vectorCoverage`, `doctor` reports `vectorCoverageLow` and `healthy: false`, and a sleep run warns; sleep refuses below a fixed hard floor of `0.5`. Defaults to `0.95`. `apps/cli/src/config.ts`, `packages/index/src/vector-coverage.ts`
 - `MEMHTML_LLM`: `off` makes every phase in `LLM_PHASES` report `no model bound` and stay `ok`, so a credential-free run is honest rather than red. `dedup-merge` and `entity-resolution` still do real deterministic work — dedup falls back to its cosine floor plus the divergence veto and still commits, and entity-resolution runs its normalization and character-overlap passes — while the rest report a reason and write nothing. Defaults to `on`. `apps/cli/src/config.ts:56-59`, `packages/sleep/src/contract.ts:143-177`
 - `MEMHTML_EXTRACT_ENTITIES`: `off` removes the one model call per write batch that extracts `memhtml-entity` metas the ops did not declare (`MEMHTML_LLM=off` removes it too). It defaults to `on`, and it changes what a write stores: extracted entities land in the files as if authored, and the write itself never waits on or fails with the model — a failed extraction is a logged warning and an unextracted batch. `apps/cli/src/config.ts:62-65`
 - `MEMHTML_MCP_BIN`: An explicit path to the `memhtml-mcp` entry point, read only by the `memhtml serve mcp` supervisor. When it is absent the supervisor uses the sibling-path default. The name is imported from one constant rather than retyped here, so this row and the `process.env` read cannot name different strings. `apps/cli/src/config.ts:67-77`

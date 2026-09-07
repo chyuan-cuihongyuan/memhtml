@@ -77,21 +77,21 @@ Entry point: `apps/cli/src/operations.ts:641`
 
 ## Ranked retrieval
 
-Entry point: `packages/index/src/retrieval.ts:331`
+Entry point: `packages/index/src/retrieval.ts:362`
 
 1. The `search` and `recall` dispatch arms build one shared scope object from the same flag set, so the two commands cannot narrow differently `apps/cli/src/run.ts:150-157`, `apps/cli/src/commands.ts:58-99`.
-2. `queryVector` embeds the query text, catching a model failure and returning undefined so the search degrades rather than erroring `packages/index/src/retrieval.ts:193-207`.
-3. `sanitizeFtsQuery` reduces the caller's prose to indexable terms, because an apostrophe or a leading hyphen causes a hard driver error rather than an empty result `packages/index/src/retrieval.ts:231`.
-4. `activeArms` drops any arm whose precondition is absent, and that dropping is the entire degradation mechanism. The vector arm needs the query vector, the salience arm needs the attached state plane, and the lexical arm needs surviving query terms `packages/index/src/retrieval-sql.ts:263-270`.
-5. `buildRrfSql` assembles the surviving arms as CTEs, unions their weighted reciprocal ranks, and sums per path with `path ASC` breaking ties. It returns undefined when no arm fires `packages/index/src/retrieval-sql.ts:282-294`.
-6. `hydrate` fetches the full rows for the fused paths in fused order, including both entity projections, the supersedes edge, and the first chunk's vector, in one statement `packages/index/src/retrieval.ts:266-290`.
-7. `applyMmr` reorders the 3x candidate pool down to the limit, using reciprocal fused position as the relevance term `packages/index/src/retrieval.ts:349-354`.
-8. `search` fetches snippets for the final paths only and returns hits plus `degraded`, `arms`, `entityScope`, and `scopeEmpty`. `recall` instead folds arcs and ordinary memories under separate character budgets `packages/index/src/retrieval.ts:360-399`, `packages/index/src/retrieval.ts:402-447`.
+2. `queryVector` embeds the query text, catching a model failure and returning undefined so the search degrades rather than erroring `packages/index/src/retrieval.ts:194-208`.
+3. `ftsQueryForms` reduces the caller's prose to indexable terms in two MATCH forms, all-terms and any-of, keeping a double-quoted span as one phrase, because an apostrophe or a leading hyphen causes a hard driver error rather than an empty result `packages/index/src/fts-query.ts:97`. A one-row probe through the caller's scope decides which form the lexical arm binds: all-terms when some file in scope holds every term, any-of otherwise `packages/index/src/retrieval.ts:328`, `packages/index/src/retrieval-sql.ts:174`.
+4. `activeArms` drops any arm whose precondition is absent, and that dropping is the entire degradation mechanism. The vector arm needs the query vector, the salience arm needs the attached state plane, and the lexical arm needs surviving query terms `packages/index/src/retrieval-sql.ts:288-295`.
+5. `buildRrfSql` assembles the surviving arms as CTEs, unions their weighted reciprocal ranks, and sums per path with `path ASC` breaking ties. It returns undefined when no arm fires `packages/index/src/retrieval-sql.ts:307-319`.
+6. `hydrate` fetches the full rows for the fused paths in fused order, including both entity projections, the supersedes edge, and the first chunk's vector, in one statement `packages/index/src/retrieval.ts:283-321`.
+7. `applyMmr` reorders the 3x candidate pool down to the limit, using reciprocal fused position as the relevance term `packages/index/src/retrieval.ts:380-385`.
+8. `search` fetches snippets for the final paths only and returns hits plus `degraded`, `arms`, `entityScope`, and `scopeEmpty`. `recall` instead folds arcs and ordinary memories under separate character budgets `packages/index/src/retrieval.ts:391-430`, `packages/index/src/retrieval.ts:433-478`.
 
 ### Related
 
-- `packages/index/src/retrieval-sql.ts:243`
-- `packages/index/src/retrieval-sql.ts:318`
+- `packages/index/src/retrieval-sql.ts:268`
+- `packages/index/src/retrieval-sql.ts:343`
 - `packages/index/src/scope.ts:1`
 - `packages/index/src/fts-query.ts:1`
 - `packages/index/src/disclosure.ts:1`
@@ -125,14 +125,15 @@ Entry point: `packages/sleep/src/run.ts:69`
 
 1. The `sleep run` dispatch arm resolves the date through the Effect clock, narrows any `--phases` subset, reads `--deep` and `--max-llm-calls`, and calls the service `apps/cli/src/run.ts:574-586`.
 2. `runIdFor` picks `sleep/<date>`, suffixing `-2` upward when that branch already exists, so a same-day rerun never collides `packages/sleep/src/run.ts:67`.
-3. The branch is created BEFORE any phase runs and every commit lands on it, so a run leaves `main` unchanged. A dry run creates no branch `packages/sleep/src/run.ts:376`.
-4. `recordRun` writes the run row as `running`, through a wrapper that keeps a reporting failure from failing the run `packages/sleep/src/run.ts:178`.
-5. `executePhases` walks the selected phases in canonical order — `SLEEP_PHASES`, seventeen as of v0.6.0 `packages/sleep/src/contract.ts:43` — running each body under `Effect.result` so a failure becomes a value the loop reads and the phases after it still run `packages/sleep/src/run.ts:460`.
-6. A failed phase is recorded, its declared dependents are blocked, and the git index is reset so the next phase's commit cannot carry half-finished work `packages/sleep/src/run.ts:478-530`. The dependency graph is `HARD_PREREQUISITES` `packages/sleep/src/contract.ts:107`, spelled one literal pair at a time so the generated phase table can parse it: `preflight` gates every one of the sixteen phases after it, and `dedup-merge` gates `compress` and `retention-triage`. Everything else is SOFT.
-7. `preflight` runs first, and it gates the WHOLE run. It fails on a dirty tree, on an `EmbedModelMismatch`, or on an `IndexStale` index; it refreshes the index so every later phase reads current rows; and it commits nothing `packages/sleep/src/phases/preflight.ts:31`. Each of its failures makes every later commit wrong rather than merely unhelpful — a dirty tree means a later phase commits the operator's bytes under sleep's trailers, a half-migrated vector space returns plausible-and-wrong cosines from dedup and mining alike, and a half-populated index makes every count describe a corpus fragment. All three end in a corrupt night with a green report, which per-phase isolation is no defense against, so a failed preflight commits nothing at all.
-8. Three phases record their non-undoable state-plane writes into the run's own ledger instead of performing them — `trace-consolidation`'s consolidation watermarks, `edge-typing`'s edge promotions, and `entity-resolution`'s entity promotions — as JSONL lines in `.memhtml/sleep/<run-id>.pending.jsonl`, staged and committed on the branch `packages/sleep/src/contract.ts:306`, `packages/sleep/src/contract.ts:501`. `merge` applies them; a discarded branch takes them with it.
-9. The run row is rewritten as `review`, `failed`, or `abandoned` for a dry run, and the report carries every phase result plus the total model calls `packages/sleep/src/run.ts:195`.
-10. Any failed phase makes the process exit 1 while the envelope stays the `sleep.report` success payload `apps/cli/src/run.ts:284`.
+3. The reaper closes every earlier `sleep_runs` row a killed process left `running`: a row whose branch is gone, or whose `started_at` is more than `SLEEP_RUN_STALE_AFTER_MS` (20 hours) before this run's start, is stamped `abandoned` with `ended_at` set, logged, and listed in the report's `reaped`. A young row whose branch exists is a live run and is left alone. A dry run reaps too; `resume` never does `packages/sleep/src/run.ts` (`reapStuckRuns`).
+4. The branch is created BEFORE any phase runs and every commit lands on it, so a run leaves `main` unchanged. A dry run creates no branch `packages/sleep/src/run.ts:376`.
+5. `recordRun` writes the run row as `running`, through a wrapper that keeps a reporting failure from failing the run `packages/sleep/src/run.ts:178`.
+6. `executePhases` walks the selected phases in canonical order — `SLEEP_PHASES`, seventeen as of v0.6.0 `packages/sleep/src/contract.ts:43` — running each body under `Effect.result` so a failure becomes a value the loop reads and the phases after it still run `packages/sleep/src/run.ts:460`.
+7. A failed phase is recorded, its declared dependents are blocked, and the git index is reset so the next phase's commit cannot carry half-finished work `packages/sleep/src/run.ts:478-530`. The dependency graph is `HARD_PREREQUISITES` `packages/sleep/src/contract.ts:107`, spelled one literal pair at a time so the generated phase table can parse it: `preflight` gates every one of the sixteen phases after it, and `dedup-merge` gates `compress` and `retention-triage`. Everything else is SOFT.
+8. `preflight` runs first, and it gates the WHOLE run. It fails on a dirty tree, on an `EmbedModelMismatch`, on an `IndexStale` index, or on a `VectorCoverageLow` vector plane (under half the chunks embedded while the plane is in use); it refreshes the index so every later phase reads current rows; and it commits nothing `packages/sleep/src/phases/preflight.ts`. Each of its failures makes every later commit wrong rather than merely unhelpful: a dirty tree means a later phase commits the operator's bytes under sleep's trailers, a half-migrated vector space returns plausible-and-wrong cosines from dedup and mining alike, a half-populated index makes every count describe a corpus fragment, and a sparse vector plane makes every cosine pass compare a sample of the corpus against itself. All four end in a corrupt night with a green report, which per-phase isolation is no defense against, so a failed preflight commits nothing at all.
+9. Three phases record their non-undoable state-plane writes into the run's own ledger instead of performing them — `trace-consolidation`'s consolidation watermarks, `edge-typing`'s edge promotions, and `entity-resolution`'s entity promotions — as JSONL lines in `.memhtml/sleep/<run-id>.pending.jsonl`, staged and committed on the branch `packages/sleep/src/contract.ts:306`, `packages/sleep/src/contract.ts:501`. `merge` applies them; a discarded branch takes them with it.
+10. The run row is rewritten as `review`, `failed`, or `abandoned` for a dry run, and the report carries every phase result plus the total model calls `packages/sleep/src/run.ts:195`.
+11. Any failed phase makes the process exit 1 while the envelope stays the `sleep.report` success payload `apps/cli/src/run.ts:284`.
 
 ### Related
 
@@ -159,6 +160,7 @@ Entry point: `packages/sleep/src/review.ts:238`
 8. An unmoved `main` fast-forwards with no merge commit; a disjoint advance lands as a merge commit that preserves both sides, with a conflict — unreachable when disjointness held — aborted and refused rather than left in progress `packages/sleep/src/review.ts:326-338`.
 9. **Only after the fast-forward succeeds** does `applyMarks` read the branch's pending-mark ledger and perform the state-plane writes the phases deferred `packages/sleep/src/review.ts:305`, `packages/sleep/src/review.ts:343`. The ledger is read as a BLOB at the branch tip rather than off the working tree, so an uncommitted file a discarded run of the same date left behind cannot be honoured. The report carries `marksPending` and `marksApplied` as TWO numbers: they agree on an ordinary merge, and a disagreement is the operator-visible reading of a plane write that did not land — the sessions in the shortfall stay unconsolidated and are re-read next cycle, which costs a model call and loses nothing. A failed apply does not fail the merge, because `main` has already moved and every mark is bookkeeping whose absence costs a repeat rather than a loss.
 10. On success the run row is rewritten as `merged` `packages/sleep/src/review.ts:307`.
+11. Last, `reindex` runs `indexer.update({ embed: true })` so `index_state.head_sha` names the merged commit, and the report carries the update's counts as `indexUpdated`, `indexHeadSha`, `indexAdded`, `indexModified`, `indexRemoved`, `indexRenamed`, `embeddingsWritten`, `indexSkipped`. It runs after the run row on purpose: the embed pass can take minutes, and a process killed inside it must leave a row that says `merged`, or a rerun of `sleep merge` reads `main` as advanced past a run still in review and refuses forever. A failed update is reported as `indexUpdated: false` with `indexError` and a stderr WARN naming the recovery; the merge is never failed over it, because `main` has already moved `packages/sleep/src/review.ts`.
 
 ### Related
 

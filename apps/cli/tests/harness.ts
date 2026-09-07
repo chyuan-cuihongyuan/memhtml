@@ -113,18 +113,27 @@ export interface Cli {
  * `--repo` is threaded on every invocation rather than set in the environment, because a test suite
  * running in parallel would otherwise share one `MEMHTML_ROOT` and two tests would write into one
  * corpus. The flag is also the path production takes for an operator running against a second repo,
- * so it is not a test-only affordance.
+ * so it is not a test-only affordance. The other half is `vitest.config.ts`, which pins `MEMHTML_ROOT`
+ * to a throwaway under the temp dir and whose teardown fails the run if anything created it, so an
+ * invocation that drops the flag lands nowhere that matters (issue #144).
  */
 export const makeCli = async (
   options: {
     readonly embedder?: EmbedderShape | undefined
     /** Bound only by extraction tests; absent is the production default (writes unextracted). */
     readonly extractor?: EntityExtractorShape | undefined
+    /** Absent reads the configured floor (the default in tests); a coverage test moves it. */
+    readonly vectorCoverageFloor?: number | undefined
   } = {}
 ): Promise<Cli> => {
   const fixture = await Effect.runPromise(makeFixtureRepo())
   const embedder = options.embedder ?? fakeEmbedder()
-  const layer = layerAppWith({ repo: fixture.root, embedder, extractor: options.extractor })
+  const layer = layerAppWith({
+    repo: fixture.root,
+    embedder,
+    extractor: options.extractor,
+    vectorCoverageFloor: options.vectorCoverageFloor
+  })
 
   const invoke = (argv: ReadonlyArray<string>) => run([...argv, "--repo", fixture.root], layer)
 

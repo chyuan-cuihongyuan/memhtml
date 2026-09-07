@@ -1,8 +1,15 @@
 import { InvalidMemory } from "@memhtml/contracts/errors"
-import { DatabaseService, type DatabaseShape, readIndexState } from "@memhtml/index"
+import {
+  DatabaseService,
+  type DatabaseShape,
+  readIndexState,
+  readVectorCoverage
+} from "@memhtml/index"
 import { EMBED_WATERMARK } from "@memhtml/llm"
 import { isSleepPhase, type RunReport, SLEEP_PHASES, type SleepPhase } from "@memhtml/sleep"
 import { Effect } from "effect"
+
+import { RetrievalPolicy } from "./api-layer.js"
 
 /**
  * Response shaping: the few places a payload is not simply the use case's own return value.
@@ -22,6 +29,7 @@ import { Effect } from "effect"
 export const indexReport = () =>
   Effect.gen(function* () {
     const db = yield* DatabaseService
+    const policy = yield* RetrievalPolicy
     /**
      * A failed watermark read is degradation, not absence: `undefined` from a failed read would
      * otherwise be indistinguishable from "no row yet" and report `headSha: null` beside counts it
@@ -32,6 +40,12 @@ export const indexReport = () =>
       Effect.orElseSucceed(() => ({ row: undefined, failed: true }))
     )
     const state = stateRead.row
+    // An unreadable coverage reads as full rather than as empty — the scope rule the doctor's copy
+    // of this read states: a database that cannot count its chunks is reported by the freshness
+    // check, not by a coverage finding blaming the vector plane for it.
+    const coverage = yield* readVectorCoverage(db, EMBED_WATERMARK).pipe(
+      Effect.orElseSucceed(() => ({ chunks: 0, embeddings: 0, coverage: 1, model: null }))
+    )
 
     /**
      * Counts degrade to `null` rather than `0`: zero is a real, healthy answer for an empty
@@ -72,6 +86,13 @@ export const indexReport = () =>
       activeFiles: counts.activeFiles.value,
       chunks: counts.chunks.value,
       embeddings: counts.embeddings.value,
+      /**
+       * `embeddings` above counts every vector; this counts the ones in the CONFIGURED space over the
+       * chunks, which is the number that decides whether the vector arm runs (issue #141). The floor
+       * travels with it so an operator reads the judgement and the threshold in one envelope.
+       */
+      vectorCoverage: coverage.coverage,
+      vectorCoverageFloor: policy.vectorCoverageFloor,
       edges: counts.edges.value,
       derivedEdges: counts.derivedEdges.value,
       tags: counts.tags.value,
@@ -165,5 +186,10 @@ export const sleepRunReport = (report: RunReport) => ({
   phases: report.phases,
   /** Phases that ended `failed`. Present so a caller does not have to filter to know. */
   failedPhases: report.phases.flatMap((phase) => (phase.status === "failed" ? [phase.phase] : [])),
-  commits: report.phases.flatMap((phase) => (phase.commitSha === null ? [] : [phase.commitSha]))
+  commits: report.phases.flatMap((phase) => (phase.commitSha === null ? [] : [phase.commitSha])),
+  /**
+   * Earlier runs' rows this run stamped `abandoned` before starting, each with its reason. Always
+   * present and usually empty; a resume reports it empty by construction.
+   */
+  reaped: report.reaped
 })

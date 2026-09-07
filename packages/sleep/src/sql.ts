@@ -6,7 +6,7 @@ import type { DatabaseShape } from "@memhtml/index"
 import { STATE_SCHEMA } from "@memhtml/index"
 import { Effect } from "effect"
 
-import type { PendingMark } from "./contract.js"
+import { isStateWriteMark, type PendingMark, type StateWriteMark } from "./contract.js"
 
 /**
  * Every read a phase makes against the index, in one module.
@@ -60,6 +60,56 @@ export interface CorpusRow {
   readonly valid_until: string | null
   readonly reprieves: number
 }
+
+/**
+ * The facet names that make a memory a DATED RECORD: one whose identity is a time slot rather than a
+ * claim. A daily journal carries `day=2026-09-02`; two journals share vocabulary and entities, so they
+ * cluster, but each is the only record of its day and neither restates the other.
+ */
+export const DATED_RECORD_FACETS: ReadonlyArray<string> = ["day"]
+
+/**
+ * The paths among `paths` that are dated `episodic` records: the members compress summarizes but never
+ * archives (issue #130). A fold over such members writes its canonical as an entry point and leaves
+ * them active, so a facet address like `day=<date>` keeps resolving.
+ */
+export const datedEpisodicAmong = (
+  db: DatabaseShape,
+  paths: ReadonlyArray<string>
+): Effect.Effect<ReadonlySet<string>, StorageFailure> =>
+  paths.length === 0
+    ? Effect.succeed(new Set<string>())
+    : db
+        .all<{ path: string }>(
+          `SELECT f.path AS path FROM files f
+           WHERE f.memory_type = 'episodic'
+             AND f.path IN (${paths.map(() => "?").join(", ")})
+             AND EXISTS (SELECT 1 FROM file_facets x
+                          WHERE x.path = f.path
+                            AND x.name IN (${DATED_RECORD_FACETS.map(() => "?").join(", ")}))`,
+          [...paths, ...DATED_RECORD_FACETS]
+        )
+        .pipe(Effect.map((rows) => new Set(rows.map((row) => row.path))))
+
+/**
+ * The active paths that already carry an authored `part_of` edge to an ACTIVE file: the dated records
+ * compress has summarized on an earlier run. Compress stamps that edge on every member it keeps, and
+ * this is what keeps the same journals from being re-banded and re-folded into a second canonical the
+ * next night: a kept member's retention inputs do not change by being summarized, so without a mark
+ * the pass would select it again. Read at pass time, so a canonical archived since (its edge then
+ * points at an archived file) releases its members for a fresh fold.
+ */
+export const summarizedDatedRecords = (
+  db: DatabaseShape
+): Effect.Effect<ReadonlySet<string>, StorageFailure> =>
+  db
+    .all<{ path: string }>(
+      `SELECT DISTINCT e.src_path AS path FROM edges e
+       JOIN files f ON f.path = e.src_path AND f.archived = 0
+       JOIN files c ON c.path = e.dst_path AND c.archived = 0
+       WHERE e.rel = 'part_of' AND e.edge_class = 'memory' AND e.derived = 0`
+    )
+    .pipe(Effect.map((rows) => new Set(rows.map((row) => row.path))))
 
 /**
  * Every active memory, oldest first.
@@ -684,15 +734,18 @@ export const markPromoted = (
   ]).pipe(Effect.asVoid)
 
 /**
- * One mark as the statement that performs it. The merge-time half of the ledger, one arm per kind.
+ * One state-write mark as the statement that performs it. The merge-time half of the ledger, one arm
+ * per write kind.
  *
- * A total switch over the union, so a `PendingMark` arm added without an applier is a compile error
- * rather than a mark a merge silently drops. That direction matters more than the reverse: a kind with
- * no producer is dead code a reader can find, while a kind with no applier is a write a run earns,
- * commits, and never makes.
+ * A total switch over `StateWriteMark`, so a write kind added to `PendingMark` without an applier is a
+ * compile error rather than a mark a merge silently drops. That direction matters more than the
+ * reverse: a kind with no producer is dead code a reader can find, while a kind with no applier is a
+ * write a run earns, commits, and never makes. The record kinds are not in this union at all:
+ * `applyPendingMarks` filters them out with `isStateWriteMark` before reaching here, because there is
+ * nothing to perform for them.
  */
 const statementFor = (
-  mark: PendingMark
+  mark: StateWriteMark
 ): { readonly sql: string; readonly params: ReadonlyArray<string | number> } => {
   switch (mark.kind) {
     case "session-consolidated":
@@ -747,12 +800,20 @@ const statementFor = (
  * Ledger ORDER is preserved, which is the order `contract.ts`'s `appendPendingMarks` records in: a
  * promotion presumes the counter row its own phase created, and the reverse order would update a row
  * that is not there.
+ *
+ * **Every mark counts as applied, and only the state-write kinds execute SQL.** A record kind
+ * (`commitment-below-floor`) is applied by having been carried to `main`, where the report that renders
+ * it lives, and it has no row to write.
  */
 export const applyPendingMarks = (
   db: DatabaseShape,
   marks: ReadonlyArray<PendingMark>
-): Effect.Effect<number, StorageFailure> =>
-  db.writeAll(marks.map(statementFor)).pipe(Effect.as(marks.length))
+): Effect.Effect<number, StorageFailure> => {
+  const statements = marks.filter(isStateWriteMark).map(statementFor)
+  return (statements.length === 0 ? Effect.void : db.writeAll(statements)).pipe(
+    Effect.as(marks.length)
+  )
+}
 
 /** One corroboration counter on a machine-proposed entity merge. */
 export interface EntityCorroborationRow {
@@ -1262,6 +1323,41 @@ export const recordRun = (
       input.startedAt,
       input.endedAt
     ]
+  )
+
+/**
+ * Every row still `running`, oldest first. The reaper's candidates, and doctor's.
+ *
+ * A predicate on `status` alone, deliberately not on age and not on `ended_at`. Which of these rows
+ * is stuck is a judgment that needs git (does the branch still exist) and a clock (how long ago), and
+ * both belong to the caller. `review`, `failed`, `merged`, and `abandoned` are rows a process finished
+ * writing, whatever their age, so none of them is a candidate.
+ */
+export const runningRuns = (
+  db: DatabaseShape
+): Effect.Effect<ReadonlyArray<RunRow>, StorageFailure> =>
+  db.all<RunRow>(
+    `SELECT run_id, branch, base_sha, head_sha, status, started_at, ended_at
+     FROM sleep_runs WHERE status = 'running' ORDER BY started_at ASC, run_id ASC`
+  )
+
+/**
+ * Close a run nothing will finish: `abandoned`, ended at `endedAt`.
+ *
+ * `AND status = 'running'` in the predicate, so the write is conditional on the state the caller read.
+ * A run that finished between the reaper's read and this write has already rewritten its own row, and
+ * an unconditional update would stamp a completed run `abandoned` over its real outcome. `head_sha` is
+ * left as it was: the row records what the run reached, and this write records only that it stopped.
+ * A lost race is therefore a no-op; the caller reads the row back and reports only a row it closed.
+ */
+export const abandonRun = (
+  db: DatabaseShape,
+  input: { readonly runId: string; readonly endedAt: string }
+): Effect.Effect<void, StorageFailure> =>
+  db.run(
+    `UPDATE sleep_runs SET status = 'abandoned', ended_at = ?
+     WHERE run_id = ? AND status = 'running'`,
+    [input.endedAt, input.runId]
   )
 
 /** Record one phase row. Reporting only; the commit trailers are what a resume reads. */

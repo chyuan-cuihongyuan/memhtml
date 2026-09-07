@@ -38,13 +38,24 @@ export interface CommandSpec {
   readonly args: ReadonlyArray<ArgSpec>
   readonly flags: ReadonlyArray<FlagSpec>
   readonly responseTypes: ReadonlyArray<ResponseType>
+  /**
+   * Complete invocations, each beginning `memhtml <name>`, that `memhtml help <name>` prints and the
+   * manifest carries. They live beside the flags they exercise so a renamed flag is caught by the
+   * test that parses every example through the real parser and validator (`help.test.ts`), rather
+   * than by a reader who tried one. Optional: a command with no example prints none, and help
+   * never fabricates one from the usage line.
+   */
+  readonly examples?: ReadonlyArray<string>
 }
 
 /**
  * Flags every command accepts. Listed once so the manifest cannot drift from behavior.
  *
- * There is no `--json` flag: the typed JSON envelope is the only output the binary has, on every
- * command, so a flag for it would be parsed, advertised, and read by nothing. Logs go to stderr.
+ * There is no global `--json` flag: the typed JSON envelope is the only output every command has, so
+ * a flag for it would be parsed, advertised, and read by nothing. Logs go to stderr. The one command
+ * with a second output shape is `help`, which renders Markdown on a terminal, and `--json` is
+ * declared on THAT command alone (`memhtml help <command> --json`, or `memhtml <command> --help --json`)
+ * so the flag is advertised exactly where it changes something.
  */
 export const GLOBAL_FLAGS: ReadonlyArray<FlagSpec> = [
   {
@@ -58,6 +69,13 @@ export const GLOBAL_FLAGS: ReadonlyArray<FlagSpec> = [
     type: "string",
     description: "Path to the memory repo. Defaults to $MEMHTML_ROOT.",
     default: ""
+  },
+  {
+    name: "help",
+    type: "boolean",
+    description:
+      "Describe this command instead of running it: usage, arguments, flags, response type, examples. Also `-h`. Markdown when stdout is a terminal, a `cli.help` envelope when piped or with --json. Flags other than --json and --dense are ignored, nothing is opened or written, exit 0.",
+    default: false
   }
 ]
 
@@ -162,7 +180,33 @@ export const COMMANDS: ReadonlyArray<CommandSpec> = [
     summary: "Emit this CLI's full machine-readable contract.",
     args: [],
     flags: [],
-    responseTypes: ["cli.manifest"]
+    responseTypes: ["cli.manifest"],
+    examples: ["memhtml manifest --dense"]
+  },
+  {
+    name: "help",
+    summary:
+      "Describe one command: usage, arguments, flags, response type, examples. Markdown on a terminal, a cli.help envelope when piped.",
+    args: [
+      {
+        name: "command",
+        description:
+          "The command to describe, one or two words (`search`, `index rebuild`). Omitted: the whole manifest, as Markdown on a terminal and as the cli.manifest envelope when piped.",
+        required: false,
+        repeatable: true
+      }
+    ],
+    flags: [
+      {
+        name: "json",
+        type: "boolean",
+        description:
+          "Emit the cli.help envelope even when stdout is a terminal. Wins over the terminal check, so a script can never receive Markdown by accident.",
+        default: false
+      }
+    ],
+    responseTypes: ["cli.help", "cli.manifest"],
+    examples: ["memhtml help search", "memhtml help index rebuild --json", "memhtml search --help"]
   },
   {
     name: "init",
@@ -246,7 +290,11 @@ export const COMMANDS: ReadonlyArray<CommandSpec> = [
       { name: "prompt-id", type: "string", description: "The prompt within that session." },
       { name: "turn-uuid", type: "string", description: "The turn within that session." }
     ],
-    responseTypes: ["memory.written"]
+    responseTypes: ["memory.written"],
+    examples: [
+      'memhtml write --title "One writer and many readers share the index" --claim "WAL admits a single writer at a time and any number of concurrent readers." --type semantic --tag infra',
+      'memhtml write --title "Checkout retries" --claim "The checkout service retries twice." --type procedural --entity service:checkout --workspace payments'
+    ]
   },
   {
     name: "apply",
@@ -320,22 +368,42 @@ export const COMMANDS: ReadonlyArray<CommandSpec> = [
       { name: "prompt-id", type: "string", description: "The prompt within that session." },
       { name: "turn-uuid", type: "string", description: "The turn within that session." }
     ],
-    responseTypes: ["memory.detail"]
+    responseTypes: ["memory.detail"],
+    examples: ["memhtml read areas/inbox/one-writer-and-many-readers-share-the-index.html --dense"]
   },
   {
     name: "search",
     summary: "Ranked search: four RRF arms plus MMR. Degrades to the lexical floor.",
-    args: [{ name: "query", description: "Prose. Never a query language.", required: true }],
+    args: [
+      {
+        name: "query",
+        description:
+          "Prose. A double-quoted span demands those words in that order; nothing else is syntax.",
+        required: true
+      }
+    ],
     flags: [
       ...SCOPE_FLAGS,
       { name: "limit", type: "int", description: "Hits to return.", default: 10 }
     ],
-    responseTypes: ["memory.hits"]
+    responseTypes: ["memory.hits"],
+    examples: [
+      'memhtml search "why the VIP drain was reverted" --limit 5',
+      "memhtml search rollback --type semantic --type procedural --tag infra",
+      "memhtml search deploy --facet doc-type=runbook --include-archived --dense"
+    ]
   },
   {
     name: "recall",
     summary: "A disclosure pack under a character budget: arcs and memories folded separately.",
-    args: [{ name: "query", description: "Prose.", required: true }],
+    args: [
+      {
+        name: "query",
+        description:
+          "Prose. A double-quoted span demands those words in that order; nothing else is syntax.",
+        required: true
+      }
+    ],
     flags: [
       ...SCOPE_FLAGS,
       {
@@ -345,7 +413,11 @@ export const COMMANDS: ReadonlyArray<CommandSpec> = [
         default: 16_000
       }
     ],
-    responseTypes: ["recall.pack"]
+    responseTypes: ["recall.pack"],
+    examples: [
+      'memhtml recall "what do we know about the checkout service" --budget 8000',
+      "memhtml recall incident --workspace payments --as-of 2026-08-01T00:00:00Z"
+    ]
   },
   {
     name: "correct",
@@ -506,7 +578,11 @@ export const COMMANDS: ReadonlyArray<CommandSpec> = [
         default: false
       }
     ],
-    responseTypes: ["memory.list"]
+    responseTypes: ["memory.list"],
+    examples: [
+      "memhtml list --type episodic --limit 20",
+      "memhtml list --facet doc-type=daily-journal --include-archived"
+    ]
   },
   {
     name: "entity activity",
@@ -604,7 +680,10 @@ export const COMMANDS: ReadonlyArray<CommandSpec> = [
       { name: "prompt-id", type: "string", description: "The prompt within that session." },
       { name: "turn-uuid", type: "string", description: "The turn within that session." }
     ],
-    responseTypes: ["task.written"]
+    responseTypes: ["task.written"],
+    examples: [
+      'memhtml task add --title "Rotate the deploy key" --claim "The deploy key expires on the first." --due 2026-10-01'
+    ]
   },
   {
     name: "task status",
@@ -664,17 +743,31 @@ export const COMMANDS: ReadonlyArray<CommandSpec> = [
   },
   {
     name: "index rebuild",
-    summary: "Rebuild index.db from the git tree at HEAD. Destroys nothing outside .memhtml/.",
+    summary:
+      "Rebuild index.db from the git tree at HEAD, keeping every stored vector whose chunk survives. Destroys nothing outside .memhtml/.",
     args: [],
     flags: [
       {
         name: "embed",
         type: "boolean",
-        description: "Fill missing vectors from Bedrock. --no-embed makes the rebuild instant.",
+        description:
+          "Fill missing vectors from Bedrock. --no-embed makes the rebuild instant and leaves new or changed chunks without a vector; the vectors already stored survive either way when the model is unchanged. With MEMHTML_EMBED=off, --embed is held to the same rules as --no-embed.",
         default: true
+      },
+      {
+        name: "force",
+        type: "boolean",
+        description:
+          "Run a rebuild that cannot write vectors (--no-embed, or --embed with MEMHTML_EMBED=off) over a store that already carries them. Without it that call is refused with ERR_REBUILD_NO_EMBED_REFUSED, because a store with vectors was embedded on purpose. Accepted and inert when the rebuild can embed.",
+        default: false
       }
     ],
-    responseTypes: ["index.report"]
+    responseTypes: ["index.report"],
+    examples: [
+      "memhtml index rebuild --no-embed",
+      "memhtml index rebuild --no-embed --force",
+      "memhtml index rebuild --repo /srv/memory"
+    ]
   },
   {
     name: "index update",
@@ -684,6 +777,22 @@ export const COMMANDS: ReadonlyArray<CommandSpec> = [
       { name: "embed", type: "boolean", description: "Fill missing vectors.", default: true }
     ],
     responseTypes: ["index.report"]
+  },
+  {
+    name: "index embed",
+    summary:
+      "Fill every chunk that has no vector in the configured space, without a rebuild. Safe to rerun; reports the gap it left.",
+    args: [],
+    flags: [
+      {
+        name: "dry-run",
+        type: "boolean",
+        description: "Report the gap (embeddingsRemaining) and write nothing.",
+        default: false
+      }
+    ],
+    responseTypes: ["index.report"],
+    examples: ["memhtml index embed", "memhtml index embed --dry-run"]
   },
   {
     name: "index status",
@@ -702,7 +811,14 @@ export const COMMANDS: ReadonlyArray<CommandSpec> = [
   {
     name: "trace search",
     summary: "FTS over session first-prompts and AI titles. Never enters memory retrieval.",
-    args: [{ name: "query", description: "Prose.", required: true }],
+    args: [
+      {
+        name: "query",
+        description:
+          "Prose. A double-quoted span demands those words in that order; nothing else is syntax.",
+        required: true
+      }
+    ],
     flags: [
       { name: "cwd", type: "string", description: "Restrict to sessions from this directory." },
       { name: "since", type: "string", description: "ISO-8601 lower bound on started_at." },
@@ -795,7 +911,8 @@ export const COMMANDS: ReadonlyArray<CommandSpec> = [
   },
   {
     name: "sleep merge",
-    summary: "Fast-forward main to the run's branch, after the discrimination gate passes.",
+    summary:
+      "Fast-forward main to the run's branch after the discrimination gate passes, then project the merged commit into the index.",
     args: [{ name: "run-id", description: "The run id.", required: true }],
     flags: [
       {
@@ -1019,7 +1136,7 @@ export const GUIDE_OP_EXAMPLE =
  * The guide: what an agent reads on its first call, before it has written anything.
  *
  * Prose, in a structured field, authored here beside `COMMANDS`, which is the design (spec
- * D8/G6). The manifest carries it on a bare `memhtml`, `memhtml help`, `memhtml --help`, and `memhtml manifest`, and
+ * D8/G6). The manifest carries it on a bare `memhtml`, `memhtml manifest`, and a piped `memhtml help`, and
  * `memhtml agents-doc` renders these same strings into `AGENTS.md`, so the doc and the live answer cannot
  * disagree. Prose kept in a separate Markdown file would be a second copy that drifts, and prose kept
  * only in `AGENTS.md` would be invisible to an agent that never opens the repo.
@@ -1033,10 +1150,15 @@ export const GUIDE: ReadonlyArray<GuideBlock> = [
     topic: "first-call",
     body:
       "You are reading this CLI's manifest: every command, argument, flag, response type, error code, " +
-      "and environment variable the binary accepts. A bare `memhtml`, `memhtml help`, `memhtml --help`, and " +
-      "`memhtml manifest` all return it, and all four answer on a machine with no repo, no database, and " +
-      "no credentials, so this is also the liveness check when something else has failed. " +
-      "Every command writes exactly ONE JSON envelope to stdout and nothing else; logs go to stderr. " +
+      "and environment variable the binary accepts. A bare `memhtml` and `memhtml manifest` return it, and " +
+      "so do `memhtml help` and `memhtml --help` when stdout is a pipe; all of them answer on a machine with " +
+      "no repo, no database, and no credentials, so this is also the liveness check when something else has " +
+      "failed. For one command, `memhtml help <command>` or `memhtml <command> --help` returns that command's " +
+      "entry as a `cli.help` envelope with a usage line and examples (Markdown instead when stdout is a " +
+      "terminal; add `--json` to force the envelope). " +
+      "Every command writes exactly ONE JSON envelope to stdout and nothing else, with one exception: help " +
+      "on a terminal writes Markdown, and piped or with `--json` it is an envelope like every other command. " +
+      "Logs go to stderr. " +
       "A success is `{apiVersion, type, data}` and a failure is `{apiVersion, error, code, suggestions}`. " +
       "Branch on `code`, never on the `error` prose: the codes and response types are append-only and a " +
       "shipped one never changes meaning, while the prose changes freely as wording improves. " +
@@ -1233,7 +1355,7 @@ export const GUIDE_TOPICS = GUIDE.map((block) => block.topic)
  */
 export const buildManifest = () => ({
   name: "memhtml",
-  version: "0.11.1", // x-release-please-version
+  version: "0.14.0", // x-release-please-version
   summary: "Read, write, and curate the git-backed memory repo.",
   apiVersion: "1",
   /**
@@ -1253,6 +1375,9 @@ export const buildManifest = () => ({
     args: command.args,
     flags: command.flags,
     responseTypes: command.responseTypes,
+    // Always an array, so an agent reading `examples: []` knows the command has none rather than
+    // wondering whether the field exists. `--dense` strips nulls, never empty arrays.
+    examples: command.examples ?? [],
     supportsJson: true,
     supportsDense: true
   }))

@@ -27,7 +27,8 @@ export {
   MAX_PER_ENTITY,
   MEMORY_BODY_BUDGET
 } from "./disclosure.js"
-export { hasFtsTerms, sanitizeFtsQuery } from "./fts-query.js"
+export type { FtsQueryForms } from "./fts-query.js"
+export { ftsQueryForms, hasFtsTerms, sanitizeFtsQuery } from "./fts-query.js"
 export {
   type GitAdapterDeps,
   makeGitPort,
@@ -42,6 +43,7 @@ export {
 } from "./git-port.js"
 export { IndexStateRow, readIndexState } from "./index-state.js"
 export {
+  type BackfillReport,
   EmbedModelMismatch,
   type EmbedPort,
   GENERATED_NAMES,
@@ -51,6 +53,7 @@ export {
   IndexStale,
   isIndexablePath,
   makeIndexer,
+  RebuildNoEmbedRefused,
   type RebuildReport,
   TREE_PREFIXES,
   type UpdateReport
@@ -148,3 +151,13 @@ export {
   type WatermarkLike,
   writeWatermark
 } from "./traces-persist.js"
+export {
+  formatCoverage,
+  readVectorCoverage,
+  VECTOR_COVERAGE_FLOOR,
+  VECTOR_COVERAGE_HARD_FLOOR,
+  VECTOR_COVERAGE_NO_VECTORS_REMEDY,
+  VECTOR_COVERAGE_REMEDY,
+  type VectorCoverage,
+  VectorCoverageLow
+} from "./vector-coverage.js"

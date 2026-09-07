@@ -592,9 +592,15 @@ export const ToolHandlers: Layer.Layer<
             superseded_by: hit.supersededBy
           })),
           degraded: result.degraded,
+          vector_coverage: result.vectorCoverage,
           arms: result.arms,
           entity_scope: result.entityScope,
-          scope_empty: result.scopeEmpty
+          scope_empty: result.scopeEmpty,
+          archived_matches: result.archivedMatches,
+          archived: result.archived.map((entry) => ({
+            path: entry.path,
+            superseded_by: entry.supersededBy
+          }))
         }
       })
     ),
@@ -636,7 +642,8 @@ export const ToolHandlers: Layer.Layer<
           },
           spent_chars: pack.spentChars,
           truncated: pack.truncated,
-          degraded: pack.degraded
+          degraded: pack.degraded,
+          vector_coverage: pack.vectorCoverage
         }
       })
     ),
@@ -933,6 +940,8 @@ export const ToolHandlers: Layer.Layer<
           edges: report.edges,
           index_fresh: report.indexFresh,
           embedder_up: report.embedderUp,
+          vector_coverage: report.vectorCoverage,
+          vector_coverage_floor: report.vectorCoverageFloor,
           last_sleep:
             report.lastSleep === null
               ? null

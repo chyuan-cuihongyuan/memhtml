@@ -4,7 +4,13 @@ import { dirname, join } from "node:path"
 import { type EdgeRel, isEdgeRel } from "@memhtml/contracts/edges"
 import { INBOX_DIR, normalizePath, TASKS_SUBDIR } from "@memhtml/contracts/paths"
 import { checkMemory } from "@memhtml/html"
-import { DatabaseService, type DatabaseShape, STATE_SCHEMA } from "@memhtml/index"
+import {
+  DatabaseService,
+  type DatabaseShape,
+  readVectorCoverage,
+  STATE_SCHEMA,
+  VECTOR_COVERAGE_REMEDY
+} from "@memhtml/index"
 import { EMBED_WATERMARK } from "@memhtml/llm"
 import {
   allPaths,
@@ -14,18 +20,20 @@ import {
   hrefFor,
   link,
   meta,
+  runningRuns,
+  stuckRunReason,
   unlink
 } from "@memhtml/sleep"
-import { attemptIo, commitSubject, readFileOrNull } from "@memhtml/store"
+import { attemptIo, commitSubject, type GitShape, readFileOrNull } from "@memhtml/store"
 import { Effect } from "effect"
 
-import { Git, Store } from "./api-layer.js"
+import { Embedder, Git, RetrievalPolicy, Store } from "./api-layer.js"
 
 /**
  * `memhtml doctor`: the corpus's own health check, and `--fix` for the two findings a repair can settle
  * without a judgement call.
  *
- * Nine checks, and each one is a claim the design makes about the corpus rather than a lint:
+ * Ten checks, and each one is a claim the design makes about the corpus rather than a lint:
  *
  * 1. **Dangling `<link>` hrefs**: an authored edge pointing at a path the tree does not hold. Design
  *    §2.3 has no foreign key on `edges` deliberately (a `<link>` may name a file the indexer has not
@@ -53,8 +61,29 @@ import { Git, Store } from "./api-layer.js"
  *    `unknown` type, which is supported, and is therefore unreachable by the typed reference the
  *    `entity` scope requires. The query returns an empty set rather than an error, so a producer
  *    emitting bare names makes its memories unfindable with nothing anywhere reporting it.
+ * 10. **Stuck sleep runs**: a `sleep_runs` row still `running` whose branch is gone, or whose start is
+ *     further back than `SLEEP_RUN_STALE_AFTER_MS`. A run writes its row `running` before the first
+ *     phase and rewrites it after the last, so a process killed in between leaves a row nothing
+ *     finishes (issue #146). A defect in the ledger, like an orphan access row. A row that is young
+ *     and whose branch exists is a live run and is not a finding.
  *
- * **`--fix` repairs exactly two of the nine, and the repair logic is imported from the sleep
+ * 11. **Vector coverage**: the share of chunks carrying a vector in the configured space
+ *    (`readVectorCoverage` in `@memhtml/index`). A SPARSE plane inverts ranking (issue #141): the
+ *    vector arm's whole list is the few embedded files, each collects a vector rank on top of its
+ *    recency rank, and an exact lexical match on an unembedded file loses to all of them, while
+ *    `degraded` stays false because the arm did fire. `chunks` and `embeddings` sat side by side in
+ *    `status` and nothing compared them; this is the comparison. Below `MEMHTML_VECTOR_COVERAGE_FLOOR`
+ *    the report says `vectorCoverageLow` and `healthy` is false.
+ *
+ *    **Scope rule: the finding applies only when the vector plane is IN USE**, meaning at least one
+ *    vector exists OR an embedder is configured (`MEMHTML_EMBED` not `off` and a document embedder in
+ *    the layer). A store with zero vectors and no embedder is the deliberate lexical-only
+ *    configuration, and it is healthy: every search on it is honestly `degraded`, and flagging it would
+ *    make `healthy: false` the normal state of a supported setup. A store with zero vectors and an
+ *    embedder bound is the incident's shape one step earlier (a `rebuild --no-embed` nobody
+ *    backfilled), and it is low. The same rule governs sleep's preflight.
+ *
+ * **`--fix` repairs exactly two of the ten, and the repair logic is imported from the sleep
  * integrity phase rather than re-ported.** `archivedFormOf` decides whether a dangling target moved
  * to the archive or is genuinely gone, and `applyHeadEdits`/`link`/`unlink`/`meta` are the byte-splice
  * editors that change one head line without touching the article. A parse→serialize round trip drops
@@ -62,12 +91,17 @@ import { Git, Store } from "./api-layer.js"
  * every file it touched. A second implementation of either would be the consumer-side reimplementation
  * of producer semantics the fleet has paid for repeatedly.
  *
- * The other seven report and do not repair. An inbox memory or task needs a human or an agent to decide
+ * The other nine report and do not repair. An inbox memory or task needs a human or an agent to decide
  * where it belongs, a vocabulary warning needs the author's intent, and a stale index needs
  * `memhtml index update`, which doctor names in its own suggestions rather than running behind the
  * operator's back. An overdue task needs the work done or the deadline moved, and a stale blocker
  * needs someone to decide whether the blocked task is actually ready. An untyped entity needs the
- * producer that wrote it to name a type, which is a vocabulary decision no repair can make.
+ * producer that wrote it to name a type, which is a vocabulary decision no repair can make. A stuck
+ * sleep run is closed by the next `memhtml sleep run` (`--dry-run` reaps too), which is the process
+ * that owns the ledger; doctor names that command and reads the same rule it applies, so the two
+ * cannot disagree about which rows are stuck. Low vector
+ * coverage needs embedding calls, which cost money and time an operator chooses to spend; the report
+ * names the two commands that spend them (`vectorCoverageRemedy`) and runs neither.
  */
 
 /** How deep the inbox may get before doctor calls it a finding. */
@@ -129,6 +163,20 @@ export interface UntypedEntityFinding {
   readonly files: number
 }
 
+/** One `sleep_runs` row a killed process left `running`. */
+export interface StuckSleepRunFinding {
+  readonly runId: string
+  readonly branch: string
+  /** The row's `started_at`, verbatim. */
+  readonly startedAt: string
+  /**
+   * `false` when the run's branch is gone, which alone makes the row stuck. `true` when the branch
+   * is still there and the row is stuck on age alone, so `memhtml sleep resume <run-id>` can still
+   * finish it. `null` when git could not answer; the row is then listed on age alone.
+   */
+  readonly branchExists: boolean | null
+}
+
 /** What a doctor pass found. Every list is present and possibly empty, so a parser never branches. */
 export interface DoctorReport {
   readonly root: string
@@ -155,6 +203,11 @@ export interface DoctorReport {
   readonly untypedEntities: ReadonlyArray<UntypedEntityFinding>
   /** Distinct untyped entity names, whether or not they fit in the sample above. */
   readonly untypedEntityTotal: number
+  /**
+   * `sleep_runs` rows still `running` that no process will finish: branch gone, or older than
+   * `SLEEP_RUN_STALE_AFTER_MS`. `memhtml sleep run` (or `memhtml sleep run --dry-run`) reaps them.
+   */
+  readonly stuckSleepRuns: ReadonlyArray<StuckSleepRunFinding>
   readonly warnings: ReadonlyArray<WarningFinding>
   /** Files the index holds that failed to parse when doctor re-read them. */
   readonly unparseable: ReadonlyArray<string>
@@ -165,6 +218,27 @@ export interface DoctorReport {
   readonly embedModelMatches: boolean
   readonly storedEmbedModel: string | null
   readonly configuredEmbedModel: string
+  /**
+   * The share of chunks carrying a vector in the configured space, `0` to `1`. `1` on an index with
+   * no chunks. Counted for `configuredEmbedModel` only, so vectors left over from another space do
+   * not read as coverage.
+   */
+  readonly vectorCoverage: number
+  /** The floor `vectorCoverageLow` is judged against: `MEMHTML_VECTOR_COVERAGE_FLOOR`, default 0.95. */
+  readonly vectorCoverageFloor: number
+  /**
+   * True when the vector plane is in use (some vector exists, or an embedder is configured) and its
+   * coverage is below the floor. Flips `healthy`. False for the embedder-less lexical-only store.
+   */
+  readonly vectorCoverageLow: boolean
+  /** Every chunk in the index, and how many carry a vector in the configured space. */
+  readonly chunks: number
+  readonly embeddings: number
+  /**
+   * What to do about `vectorCoverageLow`, or `null` when it is not low: `memhtml index embed`
+   * backfills only the missing vectors, `memhtml index rebuild --embed` rebuilds everything.
+   */
+  readonly vectorCoverageRemedy: string | null
   readonly dirty: ReadonlyArray<string>
   /**
    * Checks whose read failed, named by the report field the consumer would otherwise trust. A
@@ -401,6 +475,57 @@ const untypedEntities = (
     )
 
 /**
+ * `sleep_runs` rows a killed process left `running`, oldest first.
+ *
+ * The rule is `stuckRunReason`, imported from `@memhtml/sleep` rather than restated: it is the rule
+ * the reaper at the start of `sleep run` applies, and a second copy here would let doctor report a
+ * row the reaper then declines, or the reverse. Doctor supplies the two inputs the rule needs and
+ * the package cannot know, whether the branch exists and what time it is. A git read that fails is
+ * `null` on the finding and an `undefined` to the rule, which then judges on age alone; treating an
+ * unreadable branch as absent would list a live run.
+ *
+ * Report-only, and it counts toward `healthy`: a row that says `running` about a process that is
+ * gone is a false statement in the ledger, the same class of defect as an orphan access row. The
+ * remedy is the next `memhtml sleep run`, which owns that table.
+ */
+const stuckSleepRuns = (
+  db: DatabaseShape,
+  git: GitShape,
+  nowMillis: number
+): Effect.Effect<CheckRead<ReadonlyArray<StuckSleepRunFinding>>, never, never> =>
+  Effect.gen(function* () {
+    // A ledger that cannot be read is a DEGRADED check, not an empty one: reporting `[]` here would
+    // fold a wedged database into a clean ledger and let `healthy` believe the check ran.
+    const rowsRead = yield* runningRuns(db).pipe(
+      Effect.map((rows) => ({ rows, failed: false })),
+      Effect.orElseSucceed(() => ({
+        rows: [] as ReadonlyArray<{ run_id: string; branch: string; started_at: string }>,
+        failed: true
+      }))
+    )
+    const findings: Array<StuckSleepRunFinding> = []
+    for (const row of rowsRead.rows) {
+      const branchExists = yield* git.branchExists(row.branch).pipe(
+        Effect.map((exists): boolean | null => exists),
+        Effect.orElseSucceed(() => null)
+      )
+      const reason = stuckRunReason({
+        startedAt: row.started_at,
+        branchExists: branchExists ?? undefined,
+        nowMillis
+      })
+      if (reason === undefined) continue
+      findings.push({
+        runId: row.run_id,
+        branch: row.branch,
+        startedAt: row.started_at,
+        branchExists
+      })
+    }
+    return { value: findings, degraded: rowsRead.failed }
+  })
+
+/**
  * Re-read every active file and collect its format warnings.
  *
  * Re-read rather than taken from the index, because a warning is not a stored column. The indexer
@@ -435,6 +560,9 @@ const collectWarnings = (
 const currentYear = Effect.clockWith((clock) =>
   Effect.map(clock.currentTimeMillis, (millis) => new Date(millis).getUTCFullYear())
 )
+
+/** Now in milliseconds, through the Effect clock, so a test can pin how old a stuck run is. */
+const nowMillis = Effect.clockWith((clock) => clock.currentTimeMillis)
 
 /** Today as `YYYY-MM-DD`, through the Effect clock so a test can pin what "overdue" means. */
 const todayDate = Effect.clockWith((clock) =>
@@ -562,6 +690,8 @@ export const doctor = (options: { readonly fix: boolean }) =>
     const git = yield* Git
     const store = yield* Store
     const db = yield* DatabaseService
+    const embedder = yield* Embedder
+    const policy = yield* RetrievalPolicy
 
     /**
      * Every check that could not run, by name. Collected from the same reads the findings come
@@ -632,6 +762,9 @@ export const doctor = (options: { readonly fix: boolean }) =>
     const untypedRead = yield* untypedEntities(db)
     if (untypedRead.degraded) degraded.push("untypedEntities")
     const untyped = untypedRead.value
+    const stuckRead = yield* stuckSleepRuns(db, git, yield* nowMillis)
+    if (stuckRead.degraded) degraded.push("stuckSleepRuns")
+    const stuck = stuckRead.value
 
     const activeRead = yield* db
       .all<{ path: string }>("SELECT path FROM files WHERE archived = 0 ORDER BY path ASC")
@@ -649,6 +782,18 @@ export const doctor = (options: { readonly fix: boolean }) =>
 
     const indexFresh = state.row?.head_sha !== null && state.row?.head_sha === headSha
     const embedModelMatches = state.row?.embed_model === EMBED_WATERMARK
+
+    /**
+     * An unreadable coverage reads as full rather than as empty. Every other check here degrades to
+     * "nothing found" when its query fails, and a database that cannot count its chunks is reported by
+     * the freshness check, not by a coverage finding that would blame the vector plane for it.
+     */
+    const coverage = yield* readVectorCoverage(db, EMBED_WATERMARK).pipe(
+      Effect.orElseSucceed(() => ({ chunks: 0, embeddings: 0, coverage: 1, model: null }))
+    )
+    // The scope rule from the module comment: zero vectors and no embedder is lexical-only, not low.
+    const vectorPlaneInUse = coverage.embeddings > 0 || embedder.document !== undefined
+    const vectorCoverageLow = vectorPlaneInUse && coverage.coverage < policy.vectorCoverageFloor
 
     return {
       root: git.root,
@@ -678,12 +823,23 @@ export const doctor = (options: { readonly fix: boolean }) =>
          * `untypedEntities` is excluded for a third reason: `unknown` is a supported storage type, so a
          * bare entity name is a reachability cost rather than a defect. Gating on it would turn a
          * corpus of hand-authored files red for writing its metas the way the format allows.
+         *
+         * `stuckSleepRuns` is INCLUDED, with `orphanAccessRows`: both are rows asserting something about
+         * the corpus that stopped being true, and a ledger that says `running` about a dead process is
+         * wrong in the same way a row describing a path with no file is.
          */
         taskDepth <= INBOX_TASK_WARN_DEPTH &&
+        stuck.length === 0 &&
         warnings.length === 0 &&
         unparseable.length === 0 &&
         indexFresh &&
-        embedModelMatches,
+        embedModelMatches &&
+        /**
+         * A sparse vector plane is a defect in the index rather than a fact about the work: search
+         * returns the wrong files with `degraded: false` until it is backfilled. The scope rule above
+         * keeps the embedder-less store out of this term.
+         */
+        !vectorCoverageLow,
       dangling,
       orphanAccessRows,
       inboxDepth: depth,
@@ -694,6 +850,7 @@ export const doctor = (options: { readonly fix: boolean }) =>
       staleBlockers: stale,
       untypedEntities: untyped.sample,
       untypedEntityTotal: untyped.total,
+      stuckSleepRuns: stuck,
       warnings,
       unparseable,
       indexFresh,
@@ -702,6 +859,12 @@ export const doctor = (options: { readonly fix: boolean }) =>
       embedModelMatches,
       storedEmbedModel: state.row?.embed_model ?? null,
       configuredEmbedModel: EMBED_WATERMARK,
+      vectorCoverage: coverage.coverage,
+      vectorCoverageFloor: policy.vectorCoverageFloor,
+      vectorCoverageLow,
+      chunks: coverage.chunks,
+      embeddings: coverage.embeddings,
+      vectorCoverageRemedy: vectorCoverageLow ? VECTOR_COVERAGE_REMEDY : null,
       dirty,
       /** Checks whose read failed, by report field name. Empty when every check ran. */
       degraded,

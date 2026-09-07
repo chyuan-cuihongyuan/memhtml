@@ -25,7 +25,7 @@ memhtml search "one writer many readers"      # FTS + vector + recency + salienc
 memhtml serve mcp                             # the same store over stdio: 15 tools, 3 resources
 ```
 
-`memhtml manifest` (or a bare `memhtml`) answers with every command, flag, response type, and error code the binary accepts, and it answers on a machine with no repo, no database, and no credentials. Every command writes exactly one JSON envelope to stdout, logs go to stderr, and the exit code is 0 for success, 2 for a usage error, 1 for a runtime failure. `AGENTS.md` is generated from the same table that drives parsing, so the doc cannot drift from the binary.
+`memhtml manifest` (or a bare `memhtml`) answers with every command, flag, response type, and error code the binary accepts, and it answers on a machine with no repo, no database, and no credentials. Every command writes exactly one JSON envelope to stdout (the one exception is `memhtml help` on a terminal, which writes Markdown), logs go to stderr, and the exit code is 0 for success, 2 for a usage error, 1 for a runtime failure. `AGENTS.md` is generated from the same table that drives parsing, so the doc cannot drift from the binary.
 
 ## The design in three sentences
 
@@ -338,21 +338,21 @@ The layering is strict and TypeScript project references enforce it. `@memhtml/c
 
 None of them is published. Every workspace package is `private`, and `mise run package:assemble` bundles the libraries and the binary-bearing apps into the single `memhtml` package that carries the two binaries — the docs site and the integration-test harness stay outside the bundle (`tsdown.config.ts` names the exact set). The table below is a map of the source, not a list of things to install. `RELEASING.md` covers how the artifact is built and what must stay outside the bundle.
 
-| Package                 | What it owns                                                                    |
-| ----------------------- | ------------------------------------------------------------------------------- |
-| `@memhtml/contracts`    | Schemas, the closed vocabularies, errors, path algebra. Zero I/O.               |
-| `@memhtml/domain`       | Pure math: retention, decay, RRF, MMR, PageRank, the anti-merge guards.         |
-| `@memhtml/html`         | The memory file format: parse, serialize, hash, surgical head editors.          |
-| `@memhtml/store`        | The git-backed file store. One commit per operation, typed conflicts.           |
-| `@memhtml/index`        | SQLite schema, the git-driven indexer, four-arm RRF retrieval, the state plane. |
-| `@memhtml/traces`       | Streaming JSONL parser over `~/.claude`, with a size+mtime+offset watermark.    |
-| `@memhtml/sleep`        | The curation phases of `SLEEP_PHASES`, each an isolated commit.                 |
-| `@memhtml/llm`          | Bedrock: Cohere embeddings and forced-tool structured output.                   |
-| `@memhtml/eval`         | The fixture corpus generator and the refusable discrimination gate.             |
-| `@memhtml/cli`          | The `memhtml` binary, the envelope contract, and the one composition root.      |
-| `@memhtml/mcp`          | The `memhtml-mcp` stdio server: 15 tools, 3 resources.                          |
-| `@memhtml/consolidator` | The sandboxed eve agent that distills candidate memories from raw transcripts.  |
-| `@memhtml/docs`         | The documentation site.                                                         |
+| Package                 | What it owns                                                                                                        |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `@memhtml/contracts`    | Schemas, the closed vocabularies, errors, path algebra. Zero I/O.                                                   |
+| `@memhtml/domain`       | Pure math: retention, decay, RRF, MMR, PageRank, the anti-merge guards.                                             |
+| `@memhtml/html`         | The memory file format: parse, serialize, hash, surgical head editors.                                              |
+| `@memhtml/store`        | The git-backed file store. One commit per operation, typed conflicts.                                               |
+| `@memhtml/index`        | SQLite schema, the git-driven indexer, four-arm RRF retrieval, the state plane.                                     |
+| `@memhtml/traces`       | Streaming JSONL parser over `~/.claude`, with a size+mtime+offset watermark.                                        |
+| `@memhtml/sleep`        | The curation phases of `SLEEP_PHASES`, each an isolated commit.                                                     |
+| `@memhtml/llm`          | Bedrock: Cohere embeddings and forced-tool structured output.                                                       |
+| `@memhtml/eval`         | The fixture corpus generator and the refusable discrimination gate.                                                 |
+| `@memhtml/cli`          | The `memhtml` binary, the envelope contract, and the one composition root.                                          |
+| `@memhtml/mcp`          | The `memhtml-mcp` stdio server: 15 tools, 3 resources.                                                              |
+| `@memhtml/consolidator` | The agent that distills candidate memories from raw transcripts: an AI SDK tool loop over bounded transcript tools. |
+| `@memhtml/docs`         | The documentation site.                                                                                             |
 
 ## Development
 
