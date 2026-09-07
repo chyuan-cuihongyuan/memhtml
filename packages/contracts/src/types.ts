@@ -113,10 +113,20 @@ export const MemoryPath = Schema.String.check(Schema.isMinLength(1))
  */
 export const ENTITY_SEPARATOR = ":"
 
-/** Split an entity reference into its type and name. Absent separator ⇒ `None` type. */
+/**
+ * Split an entity reference into its type and name at the first separator. `undefined` when the
+ * reference has no separator, or when the type or the name on either side of it is empty.
+ */
 export const parseEntity = (
   entity: string
-): { readonly entityType: string; readonly entityName: string } | undefined => {
+):
+  | {
+      /** The prefix before the first separator. */
+      readonly entityType: string
+      /** Everything after the first separator, colons included. */
+      readonly entityName: string
+    }
+  | undefined => {
   const at = entity.indexOf(ENTITY_SEPARATOR)
   if (at <= 0 || at === entity.length - 1) return undefined
   return { entityType: entity.slice(0, at), entityName: entity.slice(at + 1) }
