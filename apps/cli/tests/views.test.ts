@@ -1,4 +1,4 @@
-import { DatabaseService } from "@memhtml/cli"
+import { DatabaseService, RetrievalPolicy } from "@memhtml/cli"
 import type { DatabaseShape } from "@memhtml/index"
 import { Effect, Result } from "effect"
 import { describe, expect, it } from "vitest"
@@ -48,7 +48,10 @@ describe("indexReport degrades a failed read honestly", () => {
 
   it("reports null counts and degraded: true when every read fails", async () => {
     const report = await Effect.runPromise(
-      indexReport().pipe(Effect.provideService(DatabaseService, failingDb))
+      indexReport().pipe(
+        Effect.provideService(DatabaseService, failingDb),
+        Effect.provideService(RetrievalPolicy, { vectorCoverageFloor: 0.5 })
+      )
     )
     expect(report.degraded).toBe(true)
     expect(report.files).toBeNull()
