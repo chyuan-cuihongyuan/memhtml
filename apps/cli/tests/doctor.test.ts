@@ -5,6 +5,7 @@ import { promisify } from "node:util"
 
 import { DatabaseService, Embedder, Git, RetrievalPolicy, Store } from "@memhtml/cli"
 import type { DatabaseShape } from "@memhtml/index"
+import { EMBED_WATERMARK } from "@memhtml/llm"
 import { Effect } from "effect"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 
@@ -325,5 +326,55 @@ describe("doctor reports a degraded read rather than a clean one", () => {
     expect(report.stuckSleepRuns).toEqual([])
     expect(report.warnings).toEqual([])
     expect(report.inboxDepth).toBe(0)
+  })
+
+  /**
+   * The sharper staging, and the one that pins the clause this contract exists for: the watermark
+   * read SUCCEEDS — a fresh index_state row naming the very HEAD git reports, in the configured
+   * embedding space — while every finding read fails. Freshness and the model watermark are both
+   * true and every finding list is empty, so `healthy` has exactly one way left to be false: the
+   * degraded checks. A fully-failing database cannot pin this, because a failed watermark read
+   * already makes `indexFresh` false and forces `healthy: false` for free.
+   */
+  const freshWatermarkDb = {
+    hasState: true,
+    get: (query: string) =>
+      typeof query === "string" && query.includes("index_state")
+        ? Effect.succeed({
+            head_sha: "1111111111111111111111111111111111111111",
+            embed_model: EMBED_WATERMARK
+          })
+        : Effect.fail(new Error("database is locked")),
+    all: () => Effect.fail(new Error("database is locked")),
+    run: () => Effect.fail(new Error("database is locked"))
+  } as unknown as DatabaseShape
+
+  it("refuses healthy on the degraded list alone when the watermark read is fresh", async () => {
+    const report = await Effect.runPromise(
+      doctor({ fix: false }).pipe(
+        Effect.provideService(Git, gitHalf),
+        Effect.provideService(Store, storeHalf),
+        Effect.provideService(DatabaseService, freshWatermarkDb),
+        Effect.provideService(Embedder, { document: undefined, query: undefined } as never),
+        Effect.provideService(RetrievalPolicy, { vectorCoverageFloor: 0.5 })
+      )
+    )
+    // Every check whose read failed is named, by the report field a consumer would otherwise
+    // trust — and only those: the watermark read succeeded, so `indexState` is absent.
+    expect(report.degraded).toEqual([
+      "allPaths",
+      "dangling",
+      "orphanAccessRows",
+      "inboxDepth",
+      "inboxTaskDepth",
+      "overdueTasks",
+      "staleBlockers",
+      "untypedEntities",
+      "stuckSleepRuns",
+      "warnings"
+    ])
+    // The load-bearing one: with every finding clean and freshness true, healthy is false BECAUSE
+    // the checks above never ran.
+    expect(report.healthy).toBe(false)
   })
 })
