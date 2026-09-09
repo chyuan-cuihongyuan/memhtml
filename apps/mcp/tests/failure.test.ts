@@ -170,6 +170,25 @@ describe("the wire failure a tool call produces", () => {
     expect(failure.message.startsWith("ERR_INDEX_STALE: ")).toBe(true)
   })
 
+  it("maps LlmContractViolation to ERR_MODEL_UNAVAILABLE with a recovery an agent can act on", () => {
+    /**
+     * An off-schema model turn is a MODEL failure, not an unknown one: `ERR_UNKNOWN` is the code
+     * reserved for tags this table has not met, and a known class landing there mislocates the
+     * fault for every caller branching on it. The recovery names the agent-side move — retry,
+     * then `memory_status` — because the phase-level isolation has already degraded the run, so
+     * there is nothing for the agent to repair in the corpus itself.
+     */
+    const failure = toToolFailure(
+      new LlmContractViolation({ reason: "the tool payload did not decode" })
+    )
+    expect(failure.code).toBe("ERR_MODEL_UNAVAILABLE")
+    expect(failure.message).toContain("the tool payload did not decode")
+    expect(failure.suggestions).toEqual([
+      "retry — a turn that settles off-schema is usually transient",
+      "call memory_status to see when the model-calling phases last succeeded"
+    ])
+  })
+
   it("degrades an unrecognized failure to a coded message, never to the internal-error string", () => {
     /**
      * Totality is the point of the whole module: an error class added upstream tomorrow reaches an agent

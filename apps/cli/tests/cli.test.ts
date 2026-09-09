@@ -1,4 +1,5 @@
 import { isValidDatetime } from "@memhtml/html"
+import { Effect, Layer } from "effect"
 import { describe, expect, it } from "vitest"
 
 import { buildManifest, COMMAND_NAMES, COMMANDS, GLOBAL_FLAGS } from "../src/commands.js"
@@ -15,6 +16,7 @@ import {
   render,
   succeed
 } from "../src/envelope.js"
+import { Git, Sleep } from "../src/api-layer.js"
 import { codeFor, messageFor, SUGGESTIONS } from "../src/errors.js"
 import { parseArgv, run, validate } from "../src/run.js"
 
@@ -879,6 +881,79 @@ describe("suggestions name real commands", () => {
     expect(codeFor(failure)).toBe("ERR_INDEX_STALE")
     expect(messageFor(failure)).toContain("a rebuild did not finish")
     expect(SUGGESTIONS.IndexStale?.(failure)).toEqual(["memhtml index rebuild"])
+  })
+
+  it("maps LlmContractViolation to ERR_MODEL_UNAVAILABLE with the retry recovery", () => {
+    /**
+     * An off-schema model turn is a MODEL failure, not an unknown one: `ERR_UNKNOWN` is the code
+     * reserved for tags this table has not met, and a known class landing there told every caller
+     * branching on `code` the wrong thing about where the fault lives. `ERR_MODEL_UNAVAILABLE` is
+     * the same code a dead endpoint raises, because the operator's move is identical — retry, or
+     * read `memhtml status` to see when the model-calling phases last succeeded.
+     */
+    const failure = { _tag: "LlmContractViolation", reason: "the turn settled off-schema" }
+    expect(codeFor(failure)).toBe("ERR_MODEL_UNAVAILABLE")
+    expect(messageFor(failure)).toContain("the turn settled off-schema")
+    expect(SUGGESTIONS.LlmContractViolation?.(failure)).toEqual([
+      "retry: a turn that settles off-schema is usually transient",
+      "memhtml status"
+    ])
+  })
+
+  it("answers sleep review --diff with null and diffUnavailable when git cannot diff", () => {
+    /**
+     * A diff that could not be fetched is `null` BESIDE `diffUnavailable: true`, never `""`: the
+     * empty string is also the honest answer for "the branch equals its base", so a reviewer
+     * reading `diff: ""` on a night whose phases committed could not tell a clean run from a
+     * wedged git. Staged with a Sleep half whose report reads back fine and a Git half whose diff
+     * call fails — the shape of a run whose ledger survives while its objects are gone.
+     */
+    const review = {
+      runId: "sleep/2026-09-03",
+      branch: "sleep/2026-09-03",
+      baseSha: "a".repeat(40),
+      headSha: "b".repeat(40),
+      phases: [],
+      commits: [],
+      diffStat: "",
+      files: []
+    }
+    const wedged = Layer.mergeAll(
+      Layer.succeed(Sleep, { review: () => Effect.succeed(review) } as never),
+      Layer.succeed(Git, { run: () => Effect.fail(new Error("git is wedged")) } as never)
+    ) as unknown as Parameters<typeof run>[1]
+    return run(["sleep", "review", "sleep/2026-09-03", "--diff"], wedged).then((result) => {
+      expect(result.exitCode).toBe(EXIT_OK)
+      const body = parse(result.stdout)
+      expect(body.type).toBe("sleep.review")
+      expect((body.data as { diff: string | null }).diff).toBeNull()
+      expect((body.data as { diffUnavailable: boolean }).diffUnavailable).toBe(true)
+    })
+  })
+
+  it("answers sleep review --diff with the raw diff and no unavailable flag when git answers", () => {
+    // The twin staging, so the flag cannot be a constant: the same report through a Git half that
+    // answers carries the diff VERBATIM and `diffUnavailable: false`.
+    const review = {
+      runId: "sleep/2026-09-03",
+      branch: "sleep/2026-09-03",
+      baseSha: "a".repeat(40),
+      headSha: "b".repeat(40),
+      phases: [],
+      commits: [],
+      diffStat: "",
+      files: []
+    }
+    const answering = Layer.mergeAll(
+      Layer.succeed(Sleep, { review: () => Effect.succeed(review) } as never),
+      Layer.succeed(Git, { run: () => Effect.succeed("diff --git a/x.html b/x.html\n") } as never)
+    ) as unknown as Parameters<typeof run>[1]
+    return run(["sleep", "review", "sleep/2026-09-03", "--diff"], answering).then((result) => {
+      expect(result.exitCode).toBe(EXIT_OK)
+      const body = parse(result.stdout)
+      expect((body.data as { diff: string | null }).diff).toContain("diff --git a/x.html")
+      expect((body.data as { diffUnavailable: boolean }).diffUnavailable).toBe(false)
+    })
   })
 
   it("offers `memhtml correct` for a write conflict, which is what an occupied path needs", () => {
