@@ -1,7 +1,7 @@
 import { isValidDatetime } from "@memhtml/html"
 import { Effect, Layer } from "effect"
 import { describe, expect, it } from "vitest"
-
+import { Git, Sleep } from "../src/api-layer.js"
 import { buildManifest, COMMAND_NAMES, COMMANDS, GLOBAL_FLAGS } from "../src/commands.js"
 import { CONFIG_VARS } from "../src/config.js"
 import {
@@ -16,7 +16,6 @@ import {
   render,
   succeed
 } from "../src/envelope.js"
-import { Git, Sleep } from "../src/api-layer.js"
 import { codeFor, messageFor, SUGGESTIONS } from "../src/errors.js"
 import { parseArgv, run, validate } from "../src/run.js"
 
